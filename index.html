@@ -1828,7 +1828,7 @@ function CalendarPage() {
 /* SETTINGS — Import / Export / Wipe                                            */
 /* ========================================================================== */
 
-const SYNC_URL         = 'https://script.google.com/macros/s/AKfycbzT5K_1J2idEIWNFnxc_umYjLKp4vj6fnH9r8x6VoSonxk35XgIAQCexFeACoNhHRV0/exec';
+const SYNC_URL         = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
 const PENDING_SYNC_KEY = 'liftlog.sync_pending';
 const SYNC_DEBUG_KEY   = 'liftlog.sync_debug';
 
@@ -1842,69 +1842,121 @@ async function backgroundSync(db, opts) {
   const onSuccess = opts.onSuccess || function(){};
   const onFail    = opts.onFail    || function(){};
 
-  // ── Build payload (no React hooks) ────────────────────────────
   const finishedSessions = (db.sessions || []).filter(function(s){ return s.is_finished; });
   const sortedSessions   = finishedSessions.slice().sort(function(a,b){ return (b.finished_at||0)-(a.finished_at||0); });
 
-  var notesReview = sortedSessions.flatMap(function(s) {
-    var ses = (db.session_exercises||[]).filter(function(se){ return se.session_id===s.id; });
-    var day = (db.workout_days||[]).find(function(d){ return d.id===s.day_id; });
-    var dateStr = s.finished_at ? new Date(s.finished_at*1000).toLocaleDateString() : '?';
-    return ses.filter(function(se){ return se.session_note && se.session_note.trim(); })
-              .map(function(se) {
-                var ex = (db.exercises||[]).find(function(e){ return e.id===se.exercise_id; });
-                return { session_id:s.id, date:dateStr, workout:day?day.name:'Session',
-                         exercise:ex?ex.name:'?', note:se.session_note.trim(),
-                         finished_at:s.finished_at||0 };
-              });
+  var exercisesById = Object.fromEntries((db.exercises || []).map(function(e){ return [e.id, e]; }));
+  var groupsById    = Object.fromEntries((db.groups || []).map(function(g){ return [g.id, g]; }));
+  var daysById      = Object.fromEntries((db.workout_days || []).map(function(d){ return [d.id, d]; }));
+  var setsBySesEx = {};
+  (db.session_sets || []).forEach(function(ss){
+    (setsBySesEx[ss.session_exercise_id] = setsBySesEx[ss.session_exercise_id] || []).push(ss);
   });
 
-  var exDefaultsMap = {};
+  var historyRows = [];
+  var notesRows = [];
+
   sortedSessions.forEach(function(s) {
-    (db.session_exercises||[]).filter(function(se){ return se.session_id===s.id; }).forEach(function(se) {
-      if (exDefaultsMap[se.exercise_id]) return;
-      var sets = (db.session_sets||[]).filter(function(ss){ return ss.session_exercise_id===se.id && ss.completed; })
-                                      .sort(function(a,b){ return a.set_number-b.set_number; });
-      var last = sets[sets.length-1];
-      exDefaultsMap[se.exercise_id] = {
-        exercise_id: se.exercise_id,
-        last_completed_date: s.finished_at ? new Date(s.finished_at*1000).toLocaleDateString() : null,
-        last_reps:         (last && last.actual_reps!=null   ? last.actual_reps   : se.planned_reps)         || null,
-        last_weight:       (last && last.actual_weight!=null ? last.actual_weight : se.planned_weight)       || null,
-        last_duration_sec: (last && last.actual_duration_sec!=null ? last.actual_duration_sec : se.planned_duration_sec) || null,
-        last_note: se.session_note || null,
-      };
+    var sessionTimestamp = s.finished_at ? new Date(s.finished_at * 1000).toISOString() : '';
+    (db.session_exercises || []).filter(function(se){ return se.session_id === s.id; }).forEach(function(se) {
+      var ex = exercisesById[se.exercise_id] || null;
+      var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
+      var completedSets = sets.filter(function(ss){ return !!ss.completed; });
+      if (!completedSets.length) {
+        historyRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          reps: se.planned_reps != null ? se.planned_reps : '',
+          sets: sets.length || '',
+        });
+      } else {
+        historyRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          reps: completedSets.map(function(ss){
+            return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
+          }).filter(function(v){ return v !== ''; }).join(', '),
+          sets: completedSets.length,
+        });
+      }
+      if (se.session_note && se.session_note.trim()) {
+        notesRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          note: se.session_note.trim(),
+        });
+      }
     });
   });
 
+  (db.notes_library || []).forEach(function(n) {
+    var ex = n.exercise_id ? exercisesById[n.exercise_id] : null;
+    notesRows.push({
+      timestamp: '',
+      exercise: ex ? ex.name : '',
+      note: n.text || '',
+    });
+  });
+
+  var exerciseGroupMap = {};
+  (db.day_exercises || []).forEach(function(de) {
+    var ex = exercisesById[de.exercise_id];
+    var day = daysById[de.day_id];
+    var group = day && day.group_id ? groupsById[day.group_id] : null;
+    if (!ex) return;
+    var key = (ex.name || '').trim().toLowerCase();
+    if (!key) return;
+    if (!exerciseGroupMap[key]) {
+      exerciseGroupMap[key] = {
+        exercise_name: ex.name || '',
+        group: group ? (group.name || '') : '',
+      };
+    } else if (!exerciseGroupMap[key].group && group && group.name) {
+      exerciseGroupMap[key].group = group.name;
+    }
+  });
+  (db.exercises || []).forEach(function(ex) {
+    var key = (ex.name || '').trim().toLowerCase();
+    if (!key) return;
+    if (!exerciseGroupMap[key]) {
+      exerciseGroupMap[key] = { exercise_name: ex.name || '', group: '' };
+    }
+  });
+  var exercisesRows = Object.values(exerciseGroupMap).sort(function(a,b){ return a.exercise_name.localeCompare(b.exercise_name); });
+
   var syncId   = (typeof uuid==='function') ? uuid() : Math.random().toString(36).slice(2);
   var syncedAt = new Date().toISOString();
-  var rawTables = {
-    Exercises:        db.exercises        || [],
-    WorkoutDays:      db.workout_days     || [],
-    DayExercises:     db.day_exercises    || [],
-    Sessions:         db.sessions         || [],
-    SessionExercises: db.session_exercises|| [],
-    SessionSets:      db.session_sets     || [],
-    Groups:           db.groups           || [],
-    Supersets:        db.supersets        || [],
-    NotesLibrary:     db.notes_library    || [],
-  };
-  var totalRaw = Object.values(rawTables).reduce(function(s,a){ return s+(Array.isArray(a)?a.length:0); }, 0);
   var payload = {
     data: {
-      raw:     rawTables,
-      derived: { NotesReview: notesReview, ExerciseDefaults: Object.values(exDefaultsMap) },
-      syncLog: { sync_id:syncId, synced_at:syncedAt, action:action,
-                 sessions:(db.sessions||[]).length, exercises:(db.exercises||[]).length,
-                 session_sets:(db.session_sets||[]).length, notes_library:(db.notes_library||[]).length,
-                 notes_review_rows:notesReview.length },
-      meta: { sync_id:syncId, synced_at:syncedAt, version:'liftlog.v1',
-              upsert_key:'id', dedup_note:'Upsert raw tables by id. Derived tables fully replaced each sync.' },
+      tables: {
+        History: historyRows,
+        Exercises: exercisesRows,
+        Notes: notesRows,
+      },
+      meta: {
+        sync_id: syncId,
+        synced_at: syncedAt,
+        version: 'liftlog.sheettabs.v3',
+        tabs: ['History', 'Exercises', 'Notes'],
+        columns: {
+          History: ['timestamp', 'exercise', 'reps', 'sets'],
+          Exercises: ['exercise_name', 'group'],
+          Notes: ['timestamp', 'exercise', 'note'],
+        },
+      },
+      syncLog: {
+        sync_id: syncId,
+        synced_at: syncedAt,
+        action: action,
+        history_rows: historyRows.length,
+        exercises_rows: exercisesRows.length,
+        notes_rows: notesRows.length,
+      },
     }
   };
 
-  var debugBase = { action:action, time:new Date().toLocaleString(), records: totalRaw+' records',
+  var totalRaw = historyRows.length + exercisesRows.length + notesRows.length;
+  var debugBase = { action:action, time:new Date().toLocaleString(), records: totalRaw+' rows',
                     status:null, httpStatus:null, error:null };
 
   var controller = new AbortController();
@@ -1929,7 +1981,7 @@ async function backgroundSync(db, opts) {
     localStorage.setItem('liftlog.last_sync', ts);
     var dbg = Object.assign({}, debugBase, { status:'ok', httpStatus:res.status });
     localStorage.setItem(SYNC_DEBUG_KEY, JSON.stringify(dbg));
-    console.log('[LiftLog Sync] OK —', totalRaw, 'records, action:', action);
+    console.log('[LiftLog Sync] OK —', totalRaw, 'rows, action:', action);
     onSuccess(ts);
     return { ok:true };
   } catch(err) {
@@ -1945,13 +1997,9 @@ async function backgroundSync(db, opts) {
 }
 
 function SettingsPage() {
-  const { db, setDb, mutate, showToast } = useApp();
-  const { confirm, node: confirmNode } = useConfirm();
-  const fileRef = useRef(null);
-
-  // ── Sync state (all declarations BEFORE any hooks that reference them) ──────
+  const { db, showToast } = useApp();
   const [syncing,     setSyncing]     = useState(false);
-  const [syncStatus,  setSyncStatus]  = useState('idle'); // idle | syncing | ok | error
+  const [syncStatus,  setSyncStatus]  = useState('idle');
   const [lastSync,    setLastSync]    = useState(function() {
     try { return localStorage.getItem('liftlog.last_sync') || null; } catch(e) { return null; }
   });
@@ -1959,234 +2007,38 @@ function SettingsPage() {
     try { return localStorage.getItem(PENDING_SYNC_KEY) === '1'; } catch(e) { return false; }
   });
 
-  // ── Notes Library state ────────────────────────────────────────────────────
-  const [showNoteLib, setShowNoteLib]   = useState(false);
-  const [newNoteTitle, setNewNoteTitle] = useState('');
-  const [newNoteText, setNewNoteText]   = useState('');
-  const [newNoteTags, setNewNoteTags]   = useState('');
-  const [newNoteExId, setNewNoteExId]   = useState('');
-  const [newNoteType, setNewNoteType]   = useState('cue'); // cue | reminder | tip
-
-  // ── Notes Review state ─────────────────────────────────────────────────────
-  const [showNoteReview, setShowNoteReview]   = useState(false);
-  const [reviewSessions, setReviewSessions]   = useState(5);
-  const [copiedReview, setCopiedReview]       = useState(false);
-  const [filterExId,  setFilterExId]          = useState('');
-  const [filterDayId, setFilterDayId]         = useState('');
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
-
-  const [debugLog,  setDebugLog]  = useState(function() {
-    try { return JSON.parse(localStorage.getItem(SYNC_DEBUG_KEY) || 'null') || null; } catch(e) { return null; }
-  });
-  const [showDebug, setShowDebug] = useState(false);
-
   const doManualSync = async function(action, successMsg) {
     action     = action     || 'manual-push';
     successMsg = successMsg || 'Synced ✓';
     setSyncing(true); setSyncStatus('syncing');
     await backgroundSync(db, {
       action: action,
-      onSuccess: function(ts) { setLastSync(ts); setSyncStatus('ok'); showToast(successMsg); },
-      onFail:    function(msg) { setSyncStatus('error'); showToast('Sync failed: ' + msg); },
+      onSuccess: function(ts) {
+        setLastSync(ts);
+        setSyncStatus('ok');
+        try { setPendingSync(localStorage.getItem(PENDING_SYNC_KEY) === '1'); } catch(e) {}
+        showToast(successMsg);
+      },
+      onFail: function(msg) {
+        setSyncStatus('error');
+        try { setPendingSync(localStorage.getItem(PENDING_SYNC_KEY) === '1'); } catch(e) {}
+        showToast('Sync failed: ' + msg);
+      },
     });
-    try { setDebugLog(JSON.parse(localStorage.getItem(SYNC_DEBUG_KEY) || 'null')); } catch(e) {}
-    try { setPendingSync(localStorage.getItem(PENDING_SYNC_KEY) === '1'); } catch(e) {}
     setSyncing(false);
   };
 
-  const pushToSheets   = function() { doManualSync('manual-push', 'Saved to Google Sheets ✓'); };
-  const syncAllHistory = function() { doManualSync('backfill',    'Full history synced ✓'); };
-
-  // DERIVED — reads from raw session data, never writes to it.
-  // filterExId = exercise_id string or '' for all
-  // filterDayId = workout_day_id string or '' for all
-  const buildNotesReview = function(dbRef, maxSessions, filterExId, filterDayId) {
-    maxSessions = maxSessions || 5; filterExId = filterExId || ''; filterDayId = filterDayId || '';
-    var finished = (dbRef.sessions || [])
-      .filter(function(s){ return s.is_finished; })
-      .slice().sort(function(a,b){ return (b.finished_at||b.started_at||0)-(a.finished_at||a.started_at||0); });
-    if (filterDayId) finished = finished.filter(function(s){ return s.day_id===filterDayId; });
-    finished = finished.slice(0, maxSessions);
-    return finished.flatMap(function(s) {
-      var day = dbRef.workout_days.find(function(d){ return d.id===s.day_id; });
-      var ses = (dbRef.session_exercises||[]).filter(function(se){ return se.session_id===s.id; });
-      var dateStr = s.finished_at ? new Date(s.finished_at*1000).toLocaleDateString() : '?';
-      return ses
-        .filter(function(se){ return se.session_note && se.session_note.trim(); })
-        .filter(function(se){ return !filterExId || se.exercise_id===filterExId; })
-        .map(function(se) {
-          var ex = dbRef.exercises.find(function(e){ return e.id===se.exercise_id; });
-          return {
-            session_id: s.id, date: dateStr, workout: day ? day.name : 'Session',
-            workout_day_id: s.day_id, exercise: ex ? ex.name : '?',
-            exercise_id: se.exercise_id, note: se.session_note.trim(),
-            finished_at: s.finished_at||s.started_at||0,
-          };
-        });
-    });
-  };
-
-  // DERIVED — last successful values per exercise for display in Settings
-  const buildExerciseDefaults = function(dbRef) {
-    var map = {};
-    var finished = (dbRef.sessions||[]).filter(function(s){ return s.is_finished; })
-      .slice().sort(function(a,b){ return (b.finished_at||0)-(a.finished_at||0); });
-    finished.forEach(function(s) {
-      (dbRef.session_exercises||[]).filter(function(se){ return se.session_id===s.id; }).forEach(function(se) {
-        if (map[se.exercise_id]) return;
-        var sets = (dbRef.session_sets||[]).filter(function(ss){ return ss.session_exercise_id===se.id&&ss.completed; })
-                                           .sort(function(a,b){ return a.set_number-b.set_number; });
-        var last = sets[sets.length-1];
-        map[se.exercise_id] = {
-          exercise_id: se.exercise_id,
-          last_completed_date: s.finished_at ? new Date(s.finished_at*1000).toLocaleDateString() : null,
-          last_reps:  (last&&last.actual_reps!=null ? last.actual_reps : se.planned_reps)||null,
-          last_weight:(last&&last.actual_weight!=null ? last.actual_weight : se.planned_weight)||null,
-          last_duration_sec:(last&&last.actual_duration_sec!=null ? last.actual_duration_sec : se.planned_duration_sec)||null,
-          last_note: se.session_note||null,
-        };
-      });
-    });
-    return Object.values(map);
-  };
-
-  const pullFromSheets = async function() {
-    var ok = await confirm({
-      title: 'Pull from Google Sheets?',
-      message: 'This will replace ALL local data with the version in Google Sheets. Your current data will be auto-downloaded as a backup first.',
-      confirmLabel: 'Pull & Replace',
-    });
-    if (!ok) return;
-    try {
-      var dump = { exported_at: new Date().toISOString(), tables: {
-        exercises: db.exercises, workout_days: db.workout_days, day_exercises: db.day_exercises,
-        sessions: db.sessions, session_exercises: db.session_exercises, session_sets: db.session_sets,
-        groups: db.groups, supersets: db.supersets, notes_library: db.notes_library || [],
-      }};
-      var blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
-      var a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'liftlog-pre-pull-backup-' + new Date().toISOString().slice(0,10) + '.json';
-      document.body.appendChild(a); a.click(); a.remove();
-    } catch(_) {}
-    setSyncing(true); setSyncStatus('syncing');
-    try {
-      var res  = await fetch(SYNC_URL);
-      var data = await res.json();
-      if (data && data.error) { showToast('Pull error: ' + data.error); setSyncing(false); setSyncStatus('error'); return; }
-      var t = (data.data && data.data.tables) ? data.data.tables
-            : (data.data && data.data.raw)    ? data.data.raw
-            : (data.tables || data.raw || data);
-      setDb({
-        exercises:         t.Exercises        || t.exercises        || [],
-        workout_days:      t.WorkoutDays      || t.workout_days      || [],
-        day_exercises:     t.DayExercises     || t.day_exercises     || [],
-        sessions:          t.Sessions         || t.sessions          || [],
-        session_exercises: t.SessionExercises || t.session_exercises || [],
-        session_sets:      t.SessionSets      || t.session_sets      || [],
-        groups:            t.Groups           || t.groups            || [],
-        supersets:         t.Supersets        || t.supersets         || [],
-        notes_library:     t.NotesLibrary     || t.notes_library     || [],
-      });
-      var ts = new Date().toLocaleString();
-      localStorage.setItem('liftlog.last_sync', ts);
-      setLastSync(ts); setSyncStatus('ok');
-      showToast('Pulled from Google Sheets ✓');
-    } catch(e) {
-      var msg = e && e.message ? e.message : String(e);
-      console.error('[LiftLog Pull]', e);
-      showToast('Pull failed: ' + msg); setSyncStatus('error');
-    }
-    setSyncing(false);
-  };
+  const pushToSheets = function() { doManualSync('manual-push', 'Saved to Google Sheets ✓'); };
 
   const statusColor = { idle: 'text-neutral-400', syncing: 'text-yellow-500', ok: 'text-green-600', error: 'text-red-500' };
   const statusLabel = { idle: '', syncing: 'Syncing…', ok: 'Synced', error: 'Sync error' };
 
-  // ── Export / Import / Wipe ─────────────────────────────────────────────────
-  const doExport = () => {
-    const dump = { exported_at: new Date().toISOString(), tables: {
-      exercises: db.exercises, workout_days: db.workout_days, day_exercises: db.day_exercises,
-      sessions: db.sessions, session_exercises: db.session_exercises, session_sets: db.session_sets,
-      groups: db.groups, supersets: db.supersets, notes_library: db.notes_library || [],
-    }};
-    const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `liftlog-backup-${new Date().toISOString().slice(0,10)}.json`;
-    document.body.appendChild(a); a.click(); a.remove();
-    showToast('Backup downloaded');
-  };
-
-  const doImport = async (file) => {
-    if (!file) return;
-    const text = await file.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch (e) { showToast('Invalid JSON'); return; }
-    const t = parsed.tables || parsed;
-    const expected = ['exercises','workout_days','day_exercises','sessions','session_exercises','session_sets','groups','supersets'];
-    const missing = expected.filter(k => !Array.isArray(t[k]));
-    if (missing.length === expected.length) { showToast('Not a Lift Log backup'); return; }
-    const merge = await confirm({
-      title: 'Import backup?',
-      message: 'Replace ALL current data with the contents of this file? This cannot be undone (export current data first if unsure).',
-      danger: true, confirmLabel: 'Replace',
-    });
-    if (!merge) return;
-    try {
-      const safetyDump = { exported_at: new Date().toISOString(), tables: {
-        exercises: db.exercises, workout_days: db.workout_days, day_exercises: db.day_exercises,
-        sessions: db.sessions, session_exercises: db.session_exercises, session_sets: db.session_sets,
-        groups: db.groups, supersets: db.supersets, notes_library: db.notes_library || [],
-      }};
-      const sBlob = new Blob([JSON.stringify(safetyDump, null, 2)], { type: 'application/json' });
-      const sA = document.createElement('a');
-      sA.href = URL.createObjectURL(sBlob);
-      sA.download = `liftlog-pre-import-backup-${new Date().toISOString().slice(0,10)}.json`;
-      document.body.appendChild(sA); sA.click(); sA.remove();
-    } catch (_) {}
-    setDb({
-      exercises:         t.exercises        || [],
-      workout_days:      t.workout_days      || [],
-      day_exercises:     t.day_exercises     || [],
-      sessions:          t.sessions          || [],
-      session_exercises: t.session_exercises || [],
-      session_sets:      t.session_sets      || [],
-      groups:            t.groups            || [],
-      supersets:         t.supersets         || [],
-      notes_library:     t.notes_library     || [],
-    });
-    showToast('Imported (pre-import backup downloaded)');
-  };
-
-  const doWipe = async () => {
-    const ok = await confirm({ title: 'Erase ALL data?', message: 'This cannot be undone. Export first if unsure.', danger: true, confirmLabel: 'Erase' });
-    if (!ok) return;
-    setDb(emptyDb());
-    showToast('Erased');
-  };
-
-  const reviewRows = buildNotesReview(db, reviewSessions, filterExId, filterDayId);
-  const exDefaults = buildExerciseDefaults(db);
-  const counts = {
-    exercises:         (db.exercises         || []).length,
-    workout_days:      (db.workout_days       || []).length,
-    day_exercises:     (db.day_exercises      || []).length,
-    sessions:          (db.sessions           || []).length,
-    session_exercises: (db.session_exercises  || []).length,
-    session_sets:      (db.session_sets       || []).length,
-    notes_library:     (db.notes_library      || []).length,
-  };
-
   return (
     <PageShell title="Settings">
       <div className="p-4 space-y-3">
-
-        {/* ── Google Sheets Sync ── */}
         <Card className="p-4">
           <div className="flex items-center justify-between mb-1">
-            <h3 className="font-semibold">☁️ Google Sheets Sync</h3>
+            <h3 className="font-semibold">☁️ Google Sheets Backup</h3>
             <div className="flex items-center gap-1.5">
               {pendingSync && (
                 <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-yellow-100 text-yellow-700">⏳ pending</span>
@@ -2198,244 +2050,16 @@ function SettingsPage() {
           </div>
           <p className="text-xs text-neutral-400 mb-1">Auto-syncs to Google Sheets when you finish a workout.</p>
           {lastSync && <p className="text-xs text-neutral-400 mb-2">Last sync: {lastSync}</p>}
-          <div className="flex gap-2 mb-2">
-            <Button className="flex-1 text-xs" onClick={pushToSheets} disabled={syncing}>
-              {syncing ? '…' : '⬆'} Push now
-            </Button>
-            <Button variant="outline" className="flex-1 text-xs" onClick={pullFromSheets} disabled={syncing}>
-              ⬇ Pull
-            </Button>
-          </div>
-          <Button variant="outline" className="w-full text-xs mb-2" onClick={syncAllHistory} disabled={syncing}>
-            {syncing ? '…' : '📤'} Sync all history (full backfill)
+          <Button className="w-full text-xs mb-3" onClick={pushToSheets} disabled={syncing}>
+            {syncing ? '…' : '⬆'} Push now
           </Button>
-          <button className="w-full text-xs text-neutral-400 flex items-center gap-1 justify-end"
-            onClick={function(){ setShowDebug(function(v){ return !v; }); }}>
-            {showDebug ? '▲' : '▼'} debug log
-          </button>
-          {showDebug && (
-            <div style={{background:'#1e1e1e',color:'#4ade80',borderRadius:'0.375rem',padding:'0.75rem',fontSize:'0.75rem',fontFamily:'monospace',lineHeight:'1.5',maxHeight:'10rem',overflowY:'auto',wordBreak:'break-all',marginTop:'0.25rem'}}>
-              {!debugLog ? (
-                <div style={{color:'#9ca3af'}}>No sync attempts yet.</div>
-              ) : (
-                <div>
-                  <div><span style={{color:'#9ca3af'}}>time: </span>{debugLog.time}</div>
-                  <div><span style={{color:'#9ca3af'}}>action: </span>{debugLog.action}</div>
-                  <div><span style={{color:'#9ca3af'}}>status: </span>
-                    <span style={{color: debugLog.status === 'ok' ? '#4ade80' : '#fbbf24'}}>{debugLog.status}</span>
-                  </div>
-                  {debugLog.httpStatus != null && <div><span style={{color:'#9ca3af'}}>HTTP: </span>{debugLog.httpStatus}</div>}
-                  {debugLog.records && <div><span style={{color:'#9ca3af'}}>records: </span>{debugLog.records}</div>}
-                  {debugLog.error && <div style={{marginTop:'0.25rem'}}><span style={{color:'#9ca3af'}}>error: </span><span style={{color:'#fca5a5'}}>{debugLog.error}</span></div>}
-                </div>
-              )}
-            </div>
-          )}
-        </Card>
-
-        {/* ── Notes Review ── */}
-        <Card className="p-4">
-          <button className="w-full flex items-center justify-between" onClick={() => setShowNoteReview(v => !v)}>
-            <h3 className="font-semibold">📋 Notes Review</h3>
-            <span className="text-neutral-400 text-xs">{showNoteReview ? '▲ hide' : `▼ show${reviewRows.length ? ` (${reviewRows.length})` : ''}`}</span>
-          </button>
-          {showNoteReview && (
-            <div className="mt-3 space-y-3">
-              {/* ── Filters ── */}
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-xs text-neutral-500 block mb-0.5">Sessions</label>
-                  <select value={reviewSessions} onChange={e => setReviewSessions(Number(e.target.value))}
-                    className="w-full border rounded px-2 py-1.5 text-xs">
-                    <option value={1}>Latest 1</option>
-                    <option value={3}>Latest 3</option>
-                    <option value={5}>Latest 5</option>
-                    <option value={10}>Latest 10</option>
-                    <option value={20}>Latest 20</option>
-                    <option value={999}>All</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-neutral-500 block mb-0.5">Workout day</label>
-                  <select value={filterDayId} onChange={e => setFilterDayId(e.target.value)}
-                    className="w-full border rounded px-2 py-1.5 text-xs">
-                    <option value="">All days</option>
-                    {db.workout_days.slice().sort((a,b)=>a.name.localeCompare(b.name)).map(d => (
-                      <option key={d.id} value={d.id}>{d.name}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-              <div>
-                <label className="text-xs text-neutral-500 block mb-0.5">Exercise</label>
-                <select value={filterExId} onChange={e => setFilterExId(e.target.value)}
-                  className="w-full border rounded px-2 py-1.5 text-xs">
-                  <option value="">All exercises</option>
-                  {db.exercises.filter(e=>!e.archived).slice().sort((a,b)=>a.name.localeCompare(b.name)).map(e => (
-                    <option key={e.id} value={e.id}>{e.name}</option>
-                  ))}
-                </select>
-              </div>
-              {/* ── Results ── */}
-              {reviewRows.length === 0
-                ? <p className="text-xs text-neutral-400">No notes match the current filters.</p>
-                : (<>
-                    <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                      {(() => {
-                        let curDate = null; let curWorkout = null;
-                        return reviewRows.slice().sort((a,b) => b.finished_at - a.finished_at).map((r, i) => {
-                          const newGroup = r.date !== curDate || r.workout !== curWorkout;
-                          if (newGroup) { curDate = r.date; curWorkout = r.workout; }
-                          return (
-                            <Fragment key={i}>
-                              {newGroup && <div className="text-xs font-semibold text-neutral-500 pt-1">📅 {r.date} — {r.workout}</div>}
-                              <div className="ml-3 text-xs bg-neutral-50 border rounded p-2">
-                                <span className="font-medium text-neutral-700">{r.exercise}</span>
-                                <span className="text-neutral-500">: {r.note}</span>
-                              </div>
-                            </Fragment>
-                          );
-                        });
-                      })()}
-                    </div>
-                    <Button className="w-full" onClick={copyNotesReview}>
-                      {copiedReview ? '✓ Copied!' : '📋 Copy filtered notes for workout help thread'}
-                    </Button>
-                  </>)
-              }
-            </div>
-          )}
-        </Card>
-
-        {/* ── Notes Library ── */}
-        <Card className="p-4">
-          <button className="w-full flex items-center justify-between" onClick={() => setShowNoteLib(v => !v)}>
-            <h3 className="font-semibold">📌 Notes Library</h3>
-            <span className="text-neutral-400 text-xs">{showNoteLib ? '▲ hide' : `▼ ${(db.notes_library||[]).length} notes`}</span>
-          </button>
-          {showNoteLib && (
-            <div className="mt-3 space-y-3">
-              <div className="space-y-2">
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <Label>Type</Label>
-                    <select value={newNoteType} onChange={e => setNewNoteType(e.target.value)}
-                      className="w-full border rounded px-2 py-1.5 text-sm">
-                      <option value="cue">Cue</option>
-                      <option value="reminder">Reminder</option>
-                      <option value="tip">Tip</option>
-                    </select>
-                  </div>
-                  <div>
-                    <Label>Exercise (optional)</Label>
-                    <select value={newNoteExId} onChange={e => setNewNoteExId(e.target.value)}
-                      className="w-full border rounded px-2 py-1.5 text-sm">
-                      <option value="">— Any —</option>
-                      {db.exercises.filter(e => !e.archived).slice().sort((a,b)=>a.name.localeCompare(b.name)).map(e => (
-                        <option key={e.id} value={e.id}>{e.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-                <div>
-                  <Label>Title</Label>
-                  <Input value={newNoteTitle} onChange={e => setNewNoteTitle(e.target.value)} placeholder="Short label" />
-                </div>
-                <div>
-                  <Label>Note</Label>
-                  <Textarea rows="2" value={newNoteText} onChange={e => setNewNoteText(e.target.value)} placeholder="Cue, technique note, reminder…" />
-                </div>
-                <div>
-                  <Label>Tags (comma-separated)</Label>
-                  <Input value={newNoteTags} onChange={e => setNewNoteTags(e.target.value)} placeholder="form, breathing, focus" />
-                </div>
-                <Button className="w-full" onClick={addNoteToLibrary}>+ Add to library</Button>
-              </div>
-              {(db.notes_library || []).length > 0 && (
-                <div className="space-y-2 max-h-60 overflow-y-auto pr-1 border-t pt-2">
-                  {(db.notes_library || []).slice().reverse().map(n => {
-                    const ex = n.exercise_id ? db.exercises.find(e => e.id === n.exercise_id) : null;
-                    return (
-                      <div key={n.note_id} className="bg-neutral-50 border rounded p-2 text-xs">
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <span className="font-medium text-neutral-700">{n.title || n.note_type}</span>
-                            {ex && <span className="ml-1 text-neutral-400">({ex.name})</span>}
-                            <span className="ml-1 text-neutral-300">· {n.note_type}</span>
-                          </div>
-                          <button onClick={() => deleteNoteFromLibrary(n.note_id)} className="text-red-400 hover:text-red-600 shrink-0">✕</button>
-                        </div>
-                        <p className="text-neutral-600 mt-1">{n.note_text}</p>
-                        {n.tags && <p className="text-neutral-400 mt-0.5">#{n.tags.split(',').map(t=>t.trim()).join(' #')}</p>}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </Card>
-
-        {/* ── Exercise Defaults ── */}
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">🎯 Last-session defaults</h3>
-          <p className="text-xs text-neutral-500 mb-2">Values from your last completed set per exercise. These are used as reference when planning your next session.</p>
-          {exDefaults.length === 0
-            ? <p className="text-xs text-neutral-400">No completed sessions yet.</p>
-            : (
-              <div className="space-y-1 max-h-52 overflow-y-auto">
-                {exDefaults.map(d => {
-                  const ex = db.exercises.find(e => e.id === d.exercise_id);
-                  return (
-                    <div key={d.exercise_id} className="text-xs flex gap-2 py-1 border-b last:border-0">
-                      <div className="font-medium text-neutral-700 w-28 shrink-0 truncate">{ex?.name || '?'}</div>
-                      <div className="text-neutral-500 flex-1">
-                        {d.last_weight && <span className="mr-2">⚖ {d.last_weight}</span>}
-                        {d.last_reps   && <span className="mr-2">× {d.last_reps}</span>}
-                        {d.last_duration_sec && <span className="mr-2">⏱ {d.last_duration_sec}s</span>}
-                        {d.last_note   && <span className="italic text-neutral-400">"{d.last_note.slice(0,40)}{d.last_note.length>40?'…':''}"</span>}
-                      </div>
-                      <div className="text-neutral-300 shrink-0">{d.last_completed_date}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            )
-          }
-        </Card>
-
-        {/* ── Backup & restore ── */}
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">Backup & restore</h3>
-          <p className="text-xs text-neutral-500 mb-3">
-            Data is stored locally in this browser. Export regularly so you don't lose it.
-            The import accepts files exported from the previous server version too.
-          </p>
-          <div className="flex flex-col gap-2">
-            <Button onClick={doExport}>{I.download} Export backup (JSON)</Button>
-            <Button variant="outline" onClick={() => fileRef.current?.click()}>{I.upload} Import backup (JSON)</Button>
-            <input ref={fileRef} type="file" accept="application/json,.json" className="hidden"
-              onChange={e => { doImport(e.target.files?.[0]); e.target.value = ''; }} />
-            <Button variant="dangerGhost" onClick={doWipe}>{I.trash} Erase all data</Button>
+          <div className="text-xs text-neutral-500 space-y-1">
+            <p>History tab: timestamp, exercise, reps, sets.</p>
+            <p>Exercises tab: exercise name, group.</p>
+            <p>Notes tab: timestamp, exercise, note.</p>
           </div>
-        </Card>
-
-        {/* ── Storage stats ── */}
-        <Card className="p-4">
-          <h3 className="font-semibold mb-2">Storage stats</h3>
-          <div className="text-xs text-neutral-600 grid grid-cols-2 gap-1">
-            {Object.entries(counts).map(([k, v]) => (
-              <Fragment key={k}><div>{k}</div><div className="text-right font-mono">{v}</div></Fragment>
-            ))}
-          </div>
-        </Card>
-
-        <Card className="p-4">
-          <h3 className="font-semibold mb-1">About</h3>
-          <p className="text-xs text-neutral-500">Lift Log — single-file build. All data stays on this device.</p>
         </Card>
       </div>
-      {confirmNode}
     </PageShell>
   );
 }
