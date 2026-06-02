@@ -567,6 +567,264 @@ function GroupsPage() {
 }
 
 /* ========================================================================== */
+/* BULK IMPORT — structured text → exercises + workout days                   */
+/* ========================================================================== */
+
+/*
+  Supported format (TSV or CSV, first row = header):
+  day | group | exercise | sets | reps | weight | band | duration | rest | notes | main | warmup
+
+  Rules:
+  - Header row is required (case-insensitive, order flexible)
+  - "day" column required; all other columns optional
+  - "band" column: any truthy value (yes/true/1/x) marks exercise as band type
+  - "main" / "warmup" columns: truthy = flag set
+  - "duration" column: numeric seconds; if present, exercise kind = time
+  - Rows with same day name are grouped into one workout day
+  - Exercises are matched by name (case-insensitive); existing ones reused, new ones created
+  - Missing columns default to sensible values
+*/
+
+function parseBulkImport(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+  if (lines.length < 2) return { error: 'Need at least a header row and one data row.' };
+
+  // Detect delimiter: tab preferred, fall back to comma
+  const delim = lines[0].includes('\t') ? '\t' : ',';
+  const parseLine = (l) => l.split(delim).map(c => c.trim().replace(/^["']|["']$/g, ''));
+
+  const headers = parseLine(lines[0]).map(h => h.toLowerCase().replace(/\s+/g,'_'));
+  const col = (name) => headers.indexOf(name);
+
+  const required = ['day', 'exercise'];
+  for (const r of required) {
+    if (col(r) === -1) return { error: `Missing required column: "${r}". Found: ${headers.join(', ')}` };
+  }
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = parseLine(lines[i]);
+    const get = (name) => { const idx = col(name); return idx === -1 ? '' : (cells[idx] || ''); };
+    const truthy = (v) => /^(1|yes|true|x|✓)$/i.test(v.trim());
+
+    const dayName = get('day').trim();
+    const exName  = get('exercise').trim();
+    if (!dayName || !exName) continue; // skip blank rows
+
+    const isBand     = truthy(get('band'));
+    const isDuration = get('duration').trim() !== '';
+    const kind       = isDuration ? 'time' : 'reps';
+
+    rows.push({
+      dayName,
+      groupName:   get('group').trim(),
+      exName,
+      sets:        parseInt(get('sets'))  || 3,
+      reps:        get('reps').trim()     || null,
+      weight:      isBand ? null : (get('weight').trim() || null),
+      band:        isBand ? (get('weight').trim() || null) : null, // weight col doubles as band value
+      duration:    isDuration ? (parseInt(get('duration')) || 30) : null,
+      rest:        get('rest').trim()     || null,
+      notes:       get('notes').trim()    || null,
+      isMain:      truthy(get('main')),
+      isWarmup:    truthy(get('warmup')),
+      isBand,
+      kind,
+    });
+  }
+
+  if (rows.length === 0) return { error: 'No valid data rows found after header.' };
+
+  // Build preview summary
+  const dayNames = [...new Set(rows.map(r => r.dayName))];
+  const exNames  = [...new Set(rows.map(r => r.exName))];
+  return { rows, dayNames, exNames, error: null };
+}
+
+function applyBulkImport(db, rows) {
+  // Work on a clone — caller wraps in mutate()
+  const d = db;
+
+  // ── Step 1: resolve / create groups ──────────────────────────────────────
+  const groupsByName = new Map();
+  d.groups.forEach(g => groupsByName.set(g.name.toLowerCase(), g));
+
+  const getOrCreateGroup = (name) => {
+    if (!name) return null;
+    const key = name.toLowerCase();
+    if (groupsByName.has(key)) return groupsByName.get(key).id;
+    const id = uuid();
+    const g = { id, name, sort_order: getNextPos(d.groups), created_at: nowSec() };
+    d.groups.push(g);
+    groupsByName.set(key, g);
+    return id;
+  };
+
+  // ── Step 2: resolve / create exercises ───────────────────────────────────
+  const exByName = new Map();
+  d.exercises.forEach(e => exByName.set(e.name.toLowerCase(), e));
+
+  const getOrCreateExercise = (row) => {
+    const key = row.exName.toLowerCase();
+    if (exByName.has(key)) return exByName.get(key).id;
+    const id = uuid();
+    const ex = {
+      id,
+      name: row.exName,
+      kind: row.kind,
+      use_band: row.isBand ? 1 : 0,
+      bilateral: 0,
+      description: '',
+      persistent_notes: '',
+      youtube_url: '',
+      created_at: nowSec(),
+      archived: 0,
+    };
+    d.exercises.push(ex);
+    exByName.set(key, ex);
+    return id;
+  };
+
+  // ── Step 3: resolve / create workout days ────────────────────────────────
+  const daysByName = new Map();
+  d.workout_days.forEach(day => daysByName.set(day.name.toLowerCase(), day));
+
+  const getOrCreateDay = (name, groupId) => {
+    const key = name.toLowerCase();
+    if (daysByName.has(key)) return daysByName.get(key).id;
+    const id = uuid();
+    const day = {
+      id,
+      name,
+      sort_order: getNextPos(d.workout_days),
+      created_at: nowSec(),
+      group_id: groupId,
+    };
+    d.workout_days.push(day);
+    daysByName.set(key, day);
+    return id;
+  };
+
+  // ── Step 4: insert day_exercises ──────────────────────────────────────────
+  for (const row of rows) {
+    const groupId = getOrCreateGroup(row.groupName);
+    const dayId   = getOrCreateDay(row.dayName, groupId);
+    const exId    = getOrCreateExercise(row);
+
+    // Compute next position within this day
+    const existingInDay = d.day_exercises.filter(de => de.day_id === dayId);
+    const pos = getNextPos(existingInDay);
+
+    d.day_exercises.push({
+      id:                   uuid(),
+      day_id:               dayId,
+      exercise_id:          exId,
+      position:             pos,
+      planned_sets:         row.sets,
+      planned_reps:         row.kind === 'reps' ? (row.reps || null) : null,
+      planned_weight:       row.isBand ? (row.band || null) : (row.weight || null),
+      planned_duration_sec: row.kind === 'time' ? (row.duration || 30) : null,
+      notes:                row.notes || null,
+      rest_sec:             row.rest  ? parseInt(row.rest) || null : null,
+      is_warmup:            row.isWarmup ? 1 : 0,
+      is_main:              row.isMain   ? 1 : 0,
+      superset_id:          null,
+      created_at:           nowSec(),
+    });
+  }
+
+  return d;
+}
+
+const BULK_IMPORT_EXAMPLE = `day\tgroup\texercise\tsets\treps\tweight\tband\tduration\tnotes\tmain\twarmup
+Push A\tUpper\tBench Press\t4\t6-8\t80\t\t\tKeep elbows at 45°\tyes\t
+Push A\tUpper\tIncline DB Press\t3\t10-12\t30\t\t\t\tyes\t
+Push A\tUpper\tBand Pull-Apart\t3\t15\t\tyes\t\tSqueeze at end\t\t
+Cardio\t\tPlank\t3\t\t\t\t45\tBreath steadily\t\t
+Cardio\t\tSide Plank\t3\t\t\t\t30\t\t\t`;
+
+function BulkImportModal({ open, onClose }) {
+  const { mutate, showToast } = useApp();
+  const [text, setText] = useState('');
+  const [preview, setPreview] = useState(null);
+  const [parseError, setParseError] = useState('');
+  const [showExample, setShowExample] = useState(false);
+
+  useEffect(() => {
+    if (open) { setText(''); setPreview(null); setParseError(''); setShowExample(false); }
+  }, [open]);
+
+  const handleParse = () => {
+    const result = parseBulkImport(text);
+    if (result.error) { setParseError(result.error); setPreview(null); }
+    else { setParseError(''); setPreview(result); }
+  };
+
+  const handleImport = () => {
+    if (!preview || !preview.rows) return;
+    mutate(d => applyBulkImport(d, preview.rows));
+    showToast(`Imported ${preview.rows.length} exercise entries across ${preview.dayNames.length} day(s)`);
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Bulk Import"
+      footer={<>
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        {preview && <Button onClick={handleImport}>{I.check} Import {preview.rows.length} rows</Button>}
+        {!preview && <Button onClick={handleParse} disabled={!text.trim()}>Parse →</Button>}
+      </>}>
+      <div className="space-y-3">
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <Label className="mb-0">Paste your data (TSV or CSV)</Label>
+            <button className="text-xs text-brand underline" onClick={() => setShowExample(v => !v)}>
+              {showExample ? 'hide example' : 'show example'}
+            </button>
+          </div>
+          {showExample && (
+            <div className="mb-2 text-xs bg-neutral-50 border border-neutral-200 rounded-lg p-2 overflow-x-auto whitespace-pre font-mono leading-relaxed">
+              {BULK_IMPORT_EXAMPLE}
+            </div>
+          )}
+          <Textarea
+            rows={8}
+            value={text}
+            onChange={e => { setText(e.target.value); setPreview(null); setParseError(''); }}
+            placeholder={`day\texercise\tsets\treps\tweight\n` +
+              `Push A\tBench Press\t4\t6-8\t80\n` +
+              `Push A\tBand Pull-Apart\t3\t15\t\n`}
+            className="font-mono text-xs"
+          />
+        </div>
+
+        {parseError && (
+          <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg p-2">{parseError}</div>
+        )}
+
+        {preview && (
+          <div className="bg-green-50 border border-green-200 rounded-lg p-3 space-y-1.5">
+            <div className="text-sm font-semibold text-green-800">✓ Parsed successfully</div>
+            <div className="text-xs text-green-700">{preview.rows.length} exercise entries</div>
+            <div className="text-xs text-green-700">{preview.dayNames.length} workout day(s): {preview.dayNames.join(', ')}</div>
+            <div className="text-xs text-green-700">{preview.exNames.length} unique exercise(s)</div>
+            <div className="text-xs text-neutral-500 mt-1">Existing days and exercises are reused by name. New ones will be created.</div>
+          </div>
+        )}
+
+        <div className="text-xs text-neutral-400 space-y-0.5">
+          <div className="font-medium text-neutral-500">Columns (header row required):</div>
+          <div><span className="font-medium">day</span>, <span className="font-medium">exercise</span> — required</div>
+          <div>group, sets, reps, weight, band, duration (sec), rest (sec), notes, main, warmup — optional</div>
+          <div>Use <span className="font-mono bg-neutral-100 px-0.5 rounded">yes</span> / <span className="font-mono bg-neutral-100 px-0.5 rounded">true</span> / <span className="font-mono bg-neutral-100 px-0.5 rounded">1</span> for boolean columns</div>
+          <div>Band exercises: set band=yes; weight column = band label (e.g. red, heavy)</div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ========================================================================== */
 /* EXERCISES LIBRARY                                                            */
 /* ========================================================================== */
 
@@ -575,6 +833,7 @@ function ExercisesPage() {
   const [editing, setEditing] = useState(null); // exercise object or { id: null } for new
   const { confirm, node: confirmNode } = useConfirm();
   const [q, setQ] = useState('');
+  const [showBulk, setShowBulk] = useState(false);
 
   const list = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -621,6 +880,7 @@ function ExercisesPage() {
       right={<button onClick={() => setEditing({ id: null, name: '', kind: 'reps', description: '', persistent_notes: '', youtube_url: '' })} className="p-2 text-neutral-700" aria-label="New exercise">{I.plus}</button>}>
       <div className="p-4 space-y-3">
         <Input value={q} onChange={e => setQ(e.target.value)} placeholder="Search exercises…" />
+        <Button variant="outline" className="w-full" onClick={() => setShowBulk(true)}>{I.upload} Bulk import days &amp; exercises</Button>
         <Card className="divide-y divide-neutral-100">
           {list.length === 0 && <div className="p-4 text-sm text-neutral-500 text-center">No exercises yet.</div>}
           {list.map(ex => (
@@ -639,6 +899,7 @@ function ExercisesPage() {
         </Card>
       </div>
       <ExerciseEditor open={!!editing} value={editing} onClose={() => setEditing(null)} onSave={save} />
+      <BulkImportModal open={showBulk} onClose={() => setShowBulk(false)} />
       {confirmNode}
     </PageShell>
   );
@@ -646,7 +907,7 @@ function ExercisesPage() {
 
 function ExerciseEditor({ open, value, onClose, onSave }) {
   const [v, setV] = useState(value || {});
-  useEffect(() => { if (open) setV(value || {}); }, [open]);
+  useEffect(() => { setV(value || {}); }, [value]);
   if (!open) return null;
   const isTime = (v.kind || 'reps') === 'time';
   return (
@@ -1094,9 +1355,9 @@ function startSession(db, mutate, dayId, navigate, showToast) {
       const seId = uuid();
       const defs = defMap.get(de.exercise.id) || {};
       // Planned values win; last-session defaults fill in only when planned is absent
-      const prefillReps   = (de.planned_reps   != null && de.planned_reps   !== '') ? de.planned_reps   : (defs.reps   ?? null);
-      const prefillWeight = (de.planned_weight != null && de.planned_weight !== '') ? de.planned_weight : (defs.weight ?? null);
-      const prefillDur    = (de.planned_duration_sec != null)                       ? de.planned_duration_sec : (defs.duration_sec ?? null);
+      const prefillReps   = de.planned_reps   || defs.reps   || null;
+      const prefillWeight = de.planned_weight || defs.weight || null;
+      const prefillDur    = de.planned_duration_sec || defs.duration_sec || null;
       d.session_exercises.push({
         id: seId,
         session_id: sessionId,
@@ -1391,7 +1652,7 @@ function SessionExercise({ se, onReplace }) {
         <div className="flex-1 min-w-0">
           <div className="font-medium leading-snug">{ex.name}</div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-            <span className="text-xs text-neutral-500">Plan: {isTime ? `${se.planned_duration_sec ?? '?'}s` : (se.planned_reps || '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
+            <span className="text-xs text-neutral-500">Plan: {se.planned_reps || (isTime ? `${se.planned_duration_sec}s` : '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
             <div className="flex items-center gap-1 ml-auto">
               <button onClick={() => changeSetCount(-1)} className="h-6 w-6 rounded bg-neutral-100 text-neutral-600 flex items-center justify-center text-base font-bold leading-none hover:bg-neutral-200 active:bg-neutral-300" aria-label="Remove set">−</button>
               <span className="text-xs font-medium w-12 text-center">{sets.length} set{sets.length !== 1 ? 's' : ''}</span>
@@ -1584,11 +1845,7 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   const [rDone, setRDone] = useState(false);
   const lRef = useRef(null); const rRef = useRef(null);
   const pRef = useRef(plannedSec);
-  // Refs that always reflect the latest done-state, readable inside interval callbacks
-  const lDoneRef = useRef(false); const rDoneRef = useRef(false);
   useEffect(() => { pRef.current = plannedSec; }, [plannedSec]);
-  useEffect(() => { lDoneRef.current = lDone; }, [lDone]);
-  useEffect(() => { rDoneRef.current = rDone; }, [rDone]);
   useEffect(() => { if (!lRun && !lDone) setLRem(plannedSec); }, [plannedSec, lRun, lDone]);
   useEffect(() => { if (!rRun && !rDone) setRRem(plannedSec); }, [plannedSec, rRun, rDone]);
   useEffect(() => () => {
@@ -1603,11 +1860,11 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
 
   const startSide = (side) => {
     const isL = side === 'L';
+    const otherDone = isL ? rDone : lDone;
     const ref = isL ? lRef : rRef;
     const setRun = isL ? setLRun : setRRun;
     const setRem = isL ? setLRem : setRRem;
     const setDone = isL ? setLDone : setRDone;
-    const otherDoneRef = isL ? rDoneRef : lDoneRef;
     const p = pRef.current;
     setRun(true);
     const t0 = Date.now();
@@ -1617,7 +1874,7 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
         clearInterval(ref.current); ref.current = null;
         setRem(0); setRun(false); setDone(true);
         try { playBeep(); } catch (_) {}
-        if (otherDoneRef.current) markBothDone();
+        if (otherDone) markBothDone();
       } else { setRem(left); }
     }, 200);
   };
@@ -1832,14 +2089,10 @@ async function pushToGoogleSheets(db) {
     },
   };
   try {
-    var ctrl = new AbortController();
-    var timeoutId = setTimeout(() => ctrl.abort(), 15000);
     var res = await fetch(SYNC_URL, {
       method: 'POST',
       body: new URLSearchParams({ payload: JSON.stringify(payload) }),
-      signal: ctrl.signal,
     });
-    clearTimeout(timeoutId);
     var text = await res.text();
     var json = null;
     try { json = JSON.parse(text); } catch(_) {}
@@ -1847,8 +2100,7 @@ async function pushToGoogleSheets(db) {
     if (json && json.error) throw new Error(json.error);
     return { ok: true };
   } catch(err) {
-    var msg = (err && err.name === 'AbortError') ? 'Timed out after 15s' : (err && err.message ? err.message : String(err));
-    return { ok: false, error: msg };
+    return { ok: false, error: err && err.message ? err.message : String(err) };
   }
 }
 
