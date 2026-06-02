@@ -646,7 +646,7 @@ function ExercisesPage() {
 
 function ExerciseEditor({ open, value, onClose, onSave }) {
   const [v, setV] = useState(value || {});
-  useEffect(() => { setV(value || {}); }, [value]);
+  useEffect(() => { if (open) setV(value || {}); }, [open]);
   if (!open) return null;
   const isTime = (v.kind || 'reps') === 'time';
   return (
@@ -1094,9 +1094,9 @@ function startSession(db, mutate, dayId, navigate, showToast) {
       const seId = uuid();
       const defs = defMap.get(de.exercise.id) || {};
       // Planned values win; last-session defaults fill in only when planned is absent
-      const prefillReps   = de.planned_reps   || defs.reps   || null;
-      const prefillWeight = de.planned_weight || defs.weight || null;
-      const prefillDur    = de.planned_duration_sec || defs.duration_sec || null;
+      const prefillReps   = (de.planned_reps   != null && de.planned_reps   !== '') ? de.planned_reps   : (defs.reps   ?? null);
+      const prefillWeight = (de.planned_weight != null && de.planned_weight !== '') ? de.planned_weight : (defs.weight ?? null);
+      const prefillDur    = (de.planned_duration_sec != null)                       ? de.planned_duration_sec : (defs.duration_sec ?? null);
       d.session_exercises.push({
         id: seId,
         session_id: sessionId,
@@ -1391,7 +1391,7 @@ function SessionExercise({ se, onReplace }) {
         <div className="flex-1 min-w-0">
           <div className="font-medium leading-snug">{ex.name}</div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-            <span className="text-xs text-neutral-500">Plan: {se.planned_reps || (isTime ? `${se.planned_duration_sec}s` : '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
+            <span className="text-xs text-neutral-500">Plan: {isTime ? `${se.planned_duration_sec ?? '?'}s` : (se.planned_reps || '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
             <div className="flex items-center gap-1 ml-auto">
               <button onClick={() => changeSetCount(-1)} className="h-6 w-6 rounded bg-neutral-100 text-neutral-600 flex items-center justify-center text-base font-bold leading-none hover:bg-neutral-200 active:bg-neutral-300" aria-label="Remove set">−</button>
               <span className="text-xs font-medium w-12 text-center">{sets.length} set{sets.length !== 1 ? 's' : ''}</span>
@@ -1584,7 +1584,11 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   const [rDone, setRDone] = useState(false);
   const lRef = useRef(null); const rRef = useRef(null);
   const pRef = useRef(plannedSec);
+  // Refs that always reflect the latest done-state, readable inside interval callbacks
+  const lDoneRef = useRef(false); const rDoneRef = useRef(false);
   useEffect(() => { pRef.current = plannedSec; }, [plannedSec]);
+  useEffect(() => { lDoneRef.current = lDone; }, [lDone]);
+  useEffect(() => { rDoneRef.current = rDone; }, [rDone]);
   useEffect(() => { if (!lRun && !lDone) setLRem(plannedSec); }, [plannedSec, lRun, lDone]);
   useEffect(() => { if (!rRun && !rDone) setRRem(plannedSec); }, [plannedSec, rRun, rDone]);
   useEffect(() => () => {
@@ -1599,11 +1603,11 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
 
   const startSide = (side) => {
     const isL = side === 'L';
-    const otherDone = isL ? rDone : lDone;
     const ref = isL ? lRef : rRef;
     const setRun = isL ? setLRun : setRRun;
     const setRem = isL ? setLRem : setRRem;
     const setDone = isL ? setLDone : setRDone;
+    const otherDoneRef = isL ? rDoneRef : lDoneRef;
     const p = pRef.current;
     setRun(true);
     const t0 = Date.now();
@@ -1613,7 +1617,7 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
         clearInterval(ref.current); ref.current = null;
         setRem(0); setRun(false); setDone(true);
         try { playBeep(); } catch (_) {}
-        if (otherDone) markBothDone();
+        if (otherDoneRef.current) markBothDone();
       } else { setRem(left); }
     }, 200);
   };
@@ -1828,10 +1832,14 @@ async function pushToGoogleSheets(db) {
     },
   };
   try {
+    var ctrl = new AbortController();
+    var timeoutId = setTimeout(() => ctrl.abort(), 15000);
     var res = await fetch(SYNC_URL, {
       method: 'POST',
       body: new URLSearchParams({ payload: JSON.stringify(payload) }),
+      signal: ctrl.signal,
     });
+    clearTimeout(timeoutId);
     var text = await res.text();
     var json = null;
     try { json = JSON.parse(text); } catch(_) {}
@@ -1839,7 +1847,8 @@ async function pushToGoogleSheets(db) {
     if (json && json.error) throw new Error(json.error);
     return { ok: true };
   } catch(err) {
-    return { ok: false, error: err && err.message ? err.message : String(err) };
+    var msg = (err && err.name === 'AbortError') ? 'Timed out after 15s' : (err && err.message ? err.message : String(err));
+    return { ok: false, error: msg };
   }
 }
 
