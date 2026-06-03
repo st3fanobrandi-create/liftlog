@@ -1966,8 +1966,7 @@ async function backgroundSync(db, opts) {
     var res = await fetch(SYNC_URL, {
       method: 'POST',
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: new URLSearchParams({ payload: JSON.stringify(payload) }),
     });
     clearTimeout(timer);
     var text = await res.text();
