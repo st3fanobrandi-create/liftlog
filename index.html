@@ -586,6 +586,8 @@ function ExercisesPage() {
   const [editing, setEditing] = useState(null); // exercise object or { id: null } for new
   const { confirm, node: confirmNode } = useConfirm();
   const [q, setQ] = useState('');
+  const [showAddChoice, setShowAddChoice] = useState(false);
+  const [showBulkImport, setShowBulkImport] = useState(false);
 
   const list = useMemo(() => {
     const term = q.trim().toLowerCase();
@@ -629,7 +631,36 @@ function ExercisesPage() {
 
   return (
     <PageShell title="Exercises"
-      right={<button onClick={() => setEditing({ id: null, name: '', kind: 'reps', description: '', persistent_notes: '', youtube_url: '' })} className="p-2 text-neutral-700" aria-label="New exercise">{I.plus}</button>}>
+      right={
+        <>
+          <div className="relative">
+            <button onClick={() => setShowAddChoice(v => !v)} className="p-2 text-neutral-700" aria-label="Add exercise">{I.plus}</button>
+            {showAddChoice && (
+              <div className="absolute right-0 mt-1 w-40 rounded-md border bg-white shadow-lg z-10">
+                <button
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-neutral-50"
+                  onClick={() => {
+                    setShowAddChoice(false);
+                    setEditing({ id: null, name: '', kind: 'reps', description: '', persistent_notes: '', youtube_url: '' });
+                  }}
+                >
+                  Single exercise
+                </button>
+                <button
+                  className="w-full text-left px-3 py-2 text-sm hover:bg-neutral-50"
+                  onClick={() => {
+                    setShowAddChoice(false);
+                    setShowBulkImport(true);
+                  }}
+                >
+                  Bulk import
+                </button>
+              </div>
+            )}
+          </div>
+          <BulkExerciseImportModal open={showBulkImport} onClose={() => setShowBulkImport(false)} />
+        </>
+      }>
       <div className="p-4 space-y-3">
         <Input value={q} onChange={e => setQ(e.target.value)} placeholder="Search exercises…" />
         <Card className="divide-y divide-neutral-100">
@@ -652,6 +683,212 @@ function ExercisesPage() {
       <ExerciseEditor open={!!editing} value={editing} onClose={() => setEditing(null)} onSave={save} />
       {confirmNode}
     </PageShell>
+  );
+}
+
+
+function parseBool(v) {
+  if (!v) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === 'true' || s === 'yes' || s === 'y' || s === '1';
+}
+
+function parseBulkExercises(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let dayName = '';
+  let groupName = '';
+  const items = [];
+
+  for (const line of lines) {
+    if (line.toUpperCase().startsWith('DAY:')) {
+      dayName = line.slice(4).trim();
+      continue;
+    }
+    if (line.toUpperCase().startsWith('GROUP:')) {
+      groupName = line.slice(6).trim();
+      continue;
+    }
+    if (line.toUpperCase().startsWith('EXERCISE:')) {
+      const rest = line.slice('EXERCISE:'.length).trim();
+      const parts = rest.split('|').map(p => p.trim()).filter(Boolean);
+      if (!parts.length) continue;
+      const name = parts[0];
+      const fields = {};
+      for (let i = 1; i < parts.length; i++) {
+        const eq = parts[i].indexOf('=');
+        const rawK = eq >= 0 ? parts[i].slice(0, eq) : parts[i];
+        const rawV = eq >= 0 ? parts[i].slice(eq + 1) : '';
+        const k = rawK.trim().toLowerCase();
+        const v = rawV.trim();
+        fields[k] = v;
+      }
+      items.push({
+        name,
+        sets: fields['sets'] || '',
+        reps: fields['reps'] || '',
+        rest: fields['rest'] || '',
+        band: fields['band'] || '',
+        notes: fields['notes'] || '',
+        main: parseBool(fields['main']),
+        warmup: parseBool(fields['warmup']),
+      });
+    }
+  }
+
+  return { dayName, groupName, items };
+}
+
+function applyBulkExercises(d, parsed) {
+  const { dayName, groupName, items } = parsed;
+  if (!dayName || !groupName || !items.length) return d;
+
+  d.groups = d.groups || [];
+  d.workout_days = d.workout_days || [];
+  d.exercises = d.exercises || [];
+  d.day_exercises = d.day_exercises || [];
+
+  let group = d.groups.find(g => (g.name || '').trim().toLowerCase() === groupName.trim().toLowerCase());
+  if (!group) {
+    group = { id: uuid(), name: groupName, sort_order: d.groups.reduce((m, g) => Math.max(m, g.sort_order || 0), 0) + 1 };
+    d.groups.push(group);
+  }
+
+  let day = d.workout_days.find(w => (w.name || '').trim().toLowerCase() === dayName.trim().toLowerCase() && (w.group_id || null) === group.id);
+  if (!day) {
+    day = { id: uuid(), name: dayName, group_id: group.id, sort_order: d.workout_days.reduce((m, w) => Math.max(m, w.sort_order || 0), 0) + 1 };
+    d.workout_days.push(day);
+  }
+
+  const exByName = new Map();
+  d.exercises.forEach(ex => exByName.set((ex.name || '').trim().toLowerCase(), ex));
+  const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
+
+  items.forEach((item, idx) => {
+    const key = (item.name || '').trim().toLowerCase();
+    if (!key) return;
+
+    let ex = exByName.get(key);
+    if (!ex) {
+      ex = {
+        id: uuid(),
+        name: item.name,
+        kind: 'reps',
+        description: item.notes || '',
+        persistent_notes: item.notes || '',
+        youtube_url: '',
+        archived: 0,
+      };
+      d.exercises.push(ex);
+      exByName.set(key, ex);
+    } else {
+      if (item.notes && !ex.description) ex.description = item.notes;
+      if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
+    }
+
+    let de = dayExForDay.find(x => x.exercise_id === ex.id);
+    if (!de) {
+      de = {
+        id: uuid(),
+        day_id: day.id,
+        exercise_id: ex.id,
+        position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
+        planned_sets: 1,
+        planned_reps: null,
+        planned_weight: null,
+        planned_duration_sec: null,
+        notes: '',
+        warmup: 0,
+        main: 0,
+        superset_id: null,
+        rest_hint: null,
+        band_hint: null,
+      };
+      d.day_exercises.push(de);
+      dayExForDay.push(de);
+    }
+
+    if (item.sets) {
+      const first = parseInt(String(item.sets).split('-')[0], 10);
+      if (!isNaN(first)) de.planned_sets = first;
+    }
+    if (item.reps) de.planned_reps = item.reps;
+    if (item.band) {
+      de.band_hint = item.band;
+      if (!de.planned_weight) de.planned_weight = item.band;
+    }
+    if (item.rest) de.rest_hint = item.rest;
+    if (item.notes) de.notes = item.notes;
+    de.main = item.main ? 1 : 0;
+    de.warmup = item.warmup ? 1 : 0;
+  });
+
+  return d;
+}
+
+function BulkExerciseImportModal({ open, onClose }) {
+  const { mutate, showToast } = useApp();
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const example = [
+    'DAY: Small Day D',
+    'GROUP: Shoulder Rehab',
+    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | rest=30s | notes=easy warmup | main=false | warmup=true',
+    'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
+    'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | rest=45s | notes=gently back and down | main=false | warmup=false',
+  ].join('\n');
+
+  if (!open) return null;
+
+  const doImport = () => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      showToast('Paste the bulk text first');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseBulkExercises(trimmed);
+    } catch (e) {
+      showToast('Parse error: ' + e.message);
+      return;
+    }
+    if (!parsed.dayName || !parsed.groupName || parsed.items.length === 0) {
+      showToast('Need a DAY, a GROUP, and at least one EXERCISE line');
+      return;
+    }
+    setBusy(true);
+    try {
+      mutate(d => applyBulkExercises(d, parsed));
+      showToast('Bulk import merged into plan');
+      onClose();
+    } catch (e) {
+      showToast('Import failed: ' + (e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Bulk import exercises">
+      <div className="space-y-3">
+        <p className="text-xs text-neutral-500">Paste text in the agreed format. Existing days and exercises will be merged and updated, without duplicates.</p>
+        <textarea
+          rows={10}
+          className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
+          value={text}
+          onChange={e => setText(e.target.value)}
+          placeholder={example}
+        />
+        <details className="text-xs text-neutral-500">
+          <summary className="cursor-pointer">Show example</summary>
+          <pre className="mt-2 whitespace-pre-wrap">{example}</pre>
+        </details>
+        <div className="flex gap-2 justify-end">
+          <button className="px-3 py-2 rounded-xl border" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="px-3 py-2 rounded-xl bg-neutral-900 text-white" onClick={doImport} disabled={busy}>{busy ? 'Importing...' : 'Import'}</button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
