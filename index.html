@@ -1560,7 +1560,35 @@ function SessionExercise({ se, onReplace }) {
   const sets = db.session_sets.filter(s => s.session_exercise_id === se.id).slice().sort((a, b) => a.set_number - b.set_number);
 
   const updateSet = (setId, patch) => {
-    mutate(d => { const t = d.session_sets.find(x => x.id === setId); if (t) Object.assign(t, patch); return d; });
+    mutate(d => {
+      const t = d.session_sets.find(x => x.id === setId);
+      if (t) Object.assign(t, patch);
+      return d;
+    });
+  };
+
+  const autofillFromFirst = (field) => {
+    mutate(d => {
+      const allSets = d.session_sets
+        .filter(s => s.session_exercise_id === se.id)
+        .slice()
+        .sort((a, b) => a.set_number - b.set_number);
+
+      const first = allSets[0];
+      if (!first) return d;
+
+      const value = first[field];
+      if (value == null || value === '') return d;
+
+      allSets.forEach((row, index) => {
+        if (index === 0) return;
+        if (row[field] == null || row[field] === '') {
+          row[field] = value;
+        }
+      });
+
+      return d;
+    });
   };
 
   const toggleCompleted = () => {
@@ -1578,13 +1606,10 @@ function SessionExercise({ se, onReplace }) {
     mutate(d => {
       const t = d.session_exercises.find(x => x.id === se.id);
       if (t) t.planned_duration_sec = v;
-      // Find the matching day_exercise by session.day_id + exercise_id + position
       const sess = d.sessions.find(s => s.id === se.session_id);
       if (sess) {
         const dayDes = d.day_exercises.filter(de => de.day_id === sess.day_id);
         const sameKind = dayDes.filter(de => de.exercise_id === se.exercise_id).sort((a, b) => a.position - b.position);
-        // If there are multiple of same exercise in a day, match by position-rank within that exercise.
-        // Simpler & robust: update ALL day_exercise rows in this day for this exercise_id that are time-kind.
         sameKind.forEach(de => { de.planned_duration_sec = v; });
       }
       return d;
@@ -1602,7 +1627,6 @@ function SessionExercise({ se, onReplace }) {
     });
   };
 
-  // Add or remove sets live during the workout
   const changeSetCount = (delta) => {
     mutate(d => {
       const existing = d.session_sets.filter(s => s.session_exercise_id === se.id).sort((a, b) => a.set_number - b.set_number);
@@ -1614,21 +1638,17 @@ function SessionExercise({ se, onReplace }) {
           d.session_sets.push({ id: uuid(), session_exercise_id: se.id, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
         }
       } else {
-        // Remove incomplete sets from the end first; never remove completed ones if possible
         const removable = [...existing].reverse().filter(s => !s.completed);
         const toRemove = removable.slice(0, current - next).map(s => s.id);
         if (toRemove.length < current - next) {
-          // Not enough incomplete — also remove completed from end
           const completed = [...existing].reverse().filter(s => s.completed);
           const extra = completed.slice(0, (current - next) - toRemove.length).map(s => s.id);
           toRemove.push(...extra);
         }
         const removeSet = new Set(toRemove);
         d.session_sets = d.session_sets.filter(s => !removeSet.has(s.id));
-        // Re-number remaining
         d.session_sets.filter(s => s.session_exercise_id === se.id).sort((a, b) => a.set_number - b.set_number).forEach((s, i) => { s.set_number = i + 1; });
       }
-      // Keep planned_sets in sync
       const se_row = d.session_exercises.find(x => x.id === se.id);
       if (se_row) se_row.planned_sets = next;
       return d;
@@ -1687,14 +1707,28 @@ function SessionExercise({ se, onReplace }) {
           {sets.map(s => (
             <div key={s.id} className="flex items-center gap-2">
               <div className="w-6 text-xs text-neutral-500 shrink-0">#{s.set_number}</div>
-              <Input className="flex-1 h-9 min-w-0" placeholder="reps"
-                type="text" inputMode="decimal"
+              <Input
+                className="flex-1 h-9 min-w-0"
+                placeholder="reps"
+                type="text"
+                inputMode="decimal"
                 value={s.actual_reps ?? ''}
-                onChange={e => updateSet(s.id, { actual_reps: e.target.value })} />
-              <Input className="flex-1 h-9 min-w-0" placeholder={loadPlaceholder}
-                type="text" inputMode={useBand ? 'text' : 'decimal'}
+                onChange={e => updateSet(s.id, { actual_reps: e.target.value })}
+                onBlur={() => {
+                  if (s.set_number === 1) autofillFromFirst('actual_reps');
+                }}
+              />
+              <Input
+                className="flex-1 h-9 min-w-0"
+                placeholder={loadPlaceholder}
+                type="text"
+                inputMode={useBand ? 'text' : 'decimal'}
                 value={s.actual_weight ?? ''}
-                onChange={e => updateSet(s.id, { actual_weight: e.target.value })} />
+                onChange={e => updateSet(s.id, { actual_weight: e.target.value })}
+                onBlur={() => {
+                  if (s.set_number === 1) autofillFromFirst('actual_weight');
+                }}
+              />
               <button onClick={() => { updateSet(s.id, { completed: s.completed ? 0 : 1 }); setTimeout(autoCompleteIfAllDone, 0); }}
                 className={`shrink-0 h-9 w-9 rounded-md flex items-center justify-center ${s.completed ? 'bg-brand text-white' : 'bg-neutral-100 text-neutral-500'}`}>{I.check}</button>
             </div>
@@ -1710,7 +1744,6 @@ function SessionExercise({ se, onReplace }) {
     </Card>
   );
 }
-
 /* Single countdown timer row: starts from plannedSec, beeps on natural zero,
    auto-checks the set, and notifies parent so it can auto-complete the exercise. */
 function TimeSetRow({ s, plannedSec, updateSet, onComplete }) {
