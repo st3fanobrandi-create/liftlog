@@ -1529,10 +1529,18 @@ function SessionPage({ id }) {
       se.notes_snapshot = null;
       // Reset all sets for this exercise
       d.session_sets = d.session_sets.filter(s => s.session_exercise_id !== seId);
-      const n = se.planned_sets || 1;
-      for (let i = 1; i <= n; i++) {
-        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
-      }
+     const n = de.plannedsets || 1;
+for (let i = 1; i <= n; i++) {
+  d.sessionsets.push({
+    id: uuid(),
+    sessionexerciseid: seId,
+    setnumber: i,
+    actualreps: i === 1 && de.exercise.kind !== 'time' ? prefillReps : null,
+    actualweight: i === 1 && de.exercise.kind !== 'time' ? prefillWeight : null,
+    completed: 0,
+    actualdurationsec: i === 1 && de.exercise.kind === 'time' ? prefillDur : null,
+  });
+}
       return d;
     });
     setReplaceSeId(null);
