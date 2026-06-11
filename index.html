@@ -1302,21 +1302,24 @@ function DayExerciseEditor({ open, deId, onClose }) {
 // Returns Map<exercise_id, {reps, weight, duration_sec}>
 function getExerciseDefaultsMap(db) {
   const map = new Map();
-  const finished = (db.sessions || [])
+  const finished = db.sessions
     .filter(s => s.is_finished)
-    .slice().sort((a, b) => (b.finished_at || 0) - (a.finished_at || 0));
+    .slice()
+    .sort((a, b) => (b.finished_at || 0) - (a.finished_at || 0));
+
   for (const s of finished) {
-    const ses = (db.session_exercises || []).filter(se => se.session_id === s.id);
+    const ses = db.session_exercises.filter(se => se.session_id === s.id);
     for (const se of ses) {
       if (map.has(se.exercise_id)) continue;
-      const sets = (db.session_sets || [])
+      const sets = db.session_sets
         .filter(ss => ss.session_exercise_id === se.id && ss.completed)
         .sort((a, b) => a.set_number - b.set_number);
       const lastSet = sets[sets.length - 1];
       map.set(se.exercise_id, {
-        reps:         (lastSet?.actual_reps   ?? se.planned_reps)         || null,
-        weight:       (lastSet?.actual_weight ?? se.planned_weight)       || null,
-        duration_sec: (lastSet?.actual_duration_sec ?? se.planned_duration_sec) || null,
+        reps: lastSet?.actual_reps ?? se.planned_reps ?? null,
+        weight: lastSet?.actual_weight ?? se.planned_weight ?? null,
+        durationsec: lastSet?.actual_duration_sec ?? se.planned_duration_sec ?? null,
+        note: se.session_note ?? null,
       });
     }
   }
@@ -1340,11 +1343,13 @@ function startSession(db, mutate, dayId, navigate, showToast) {
     const ssLabelById = new Map(day.supersets.map(s => [s.id, s.label]));
     day.exercises.forEach((de, idx) => {
       const seId = uuid();
-      const defs = defMap.get(de.exercise.id) || {};
-      // Planned values win; last-session defaults fill in only when planned is absent
-      const prefillReps   = de.planned_reps   || defs.reps   || null;
-      const prefillWeight = de.planned_weight || defs.weight || null;
-      const prefillDur    = de.planned_duration_sec || defs.duration_sec || null;
+            const defs = defMap.get(de.exercise.id) || {};
+      // Last session wins; planned values are fallback when no history exists
+      const prefillReps = defs.reps ?? de.planned_reps ?? null;
+      const prefillWeight = defs.weight ?? de.planned_weight ?? null;
+      const prefillDur = defs.durationsec ?? de.planned_duration_sec ?? null;
+      const prefillNote = defs.note ?? null;
+
       d.session_exercises.push({
         id: seId,
         session_id: sessionId,
@@ -1359,7 +1364,7 @@ function startSession(db, mutate, dayId, navigate, showToast) {
         planned_duration_sec: prefillDur,
         superset_label: de.superset_id ? (ssLabelById.get(de.superset_id) || null) : null,
         superset_key: de.superset_id || null,
-        session_note: null,
+        session_note: prefillNote,
       });
       const n = de.planned_sets || 1;
       for (let i = 1; i <= n; i++) {
