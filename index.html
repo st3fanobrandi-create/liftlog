@@ -781,7 +781,7 @@ function applyBulkExercises(d, parsed) {
       d.exercises.push(ex);
       exByName.set(key, ex);
     } else {
-      if (item.notes && !ex.description) ex.description = item.notes;
+      if (item.notes) ex.description = item.notes;
       if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
     }
 
