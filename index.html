@@ -143,7 +143,6 @@ function AppProvider({ children }) {
 }
 
 const useApp = () => useContext(AppCtx);
-
 /* ============================================================================ */
 /* ERROR BOUNDARY                                                                */
 /* ============================================================================ */
@@ -2105,7 +2104,7 @@ function CalendarPage() {
 }
 
 /* ========================================================================== */
-/* SETTINGS — Import / Export / Wipe                                            */
+/* SETTINGS — Import / Export / Wipe                                          */
 /* ========================================================================== */
 
 const SYNC_URL         = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
@@ -2189,20 +2188,82 @@ async function backgroundSync(db, opts) {
     if (!exerciseGroupMap[key]) {
       exerciseGroupMap[key] = {
         exercise_name: ex.name || '',
+        description: ex.description || '',
         group: group ? (group.name || '') : '',
       };
-    } else if (!exerciseGroupMap[key].group && group && group.name) {
-      exerciseGroupMap[key].group = group.name;
+    } else {
+      if (!exerciseGroupMap[key].description && ex.description) {
+        exerciseGroupMap[key].description = ex.description;
+      }
+      if (!exerciseGroupMap[key].group && group && group.name) {
+        exerciseGroupMap[key].group = group.name;
+      }
     }
   });
   (db.exercises || []).forEach(function(ex) {
     var key = (ex.name || '').trim().toLowerCase();
     if (!key) return;
     if (!exerciseGroupMap[key]) {
-      exerciseGroupMap[key] = { exercise_name: ex.name || '', group: '' };
+      exerciseGroupMap[key] = {
+        exercise_name: ex.name || '',
+        description: ex.description || '',
+        group: '',
+      };
     }
   });
   var exercisesRows = Object.values(exerciseGroupMap).sort(function(a,b){ return a.exercise_name.localeCompare(b.exercise_name); });
+
+  var groupsRows = (db.groups || [])
+    .slice()
+    .sort(function(a,b){ return (a.sort_order || 0) - (b.sort_order || 0); })
+    .map(function(g){
+      return {
+        group_name: g.name || '',
+        sort_order: g.sort_order != null ? g.sort_order : '',
+      };
+    });
+
+  var workoutDaysRows = (db.workout_days || [])
+    .slice()
+    .sort(function(a,b){ return (a.sort_order || 0) - (b.sort_order || 0); })
+    .map(function(d){
+      var group = d.group_id ? groupsById[d.group_id] : null;
+      return {
+        day_name: d.name || '',
+        group_name: group ? (group.name || '') : '',
+        sort_order: d.sort_order != null ? d.sort_order : '',
+      };
+    });
+
+  var dayExercisesRows = (db.day_exercises || [])
+    .slice()
+    .sort(function(a,b){
+      if ((a.day_id || '') === (b.day_id || '')) return (a.position || 0) - (b.position || 0);
+      return String(a.day_id || '').localeCompare(String(b.day_id || ''));
+    })
+    .map(function(de){
+      var day = daysById[de.day_id];
+      var group = day && day.group_id ? groupsById[day.group_id] : null;
+      var ex = exercisesById[de.exercise_id];
+      return {
+        day_name: day ? (day.name || '') : '',
+        group_name: group ? (group.name || '') : '',
+        position: de.position != null ? de.position : '',
+        exercise_name: ex ? (ex.name || '') : '',
+        planned_sets: de.planned_sets != null ? de.planned_sets : '',
+        planned_reps: de.planned_reps != null ? de.planned_reps : '',
+        planned_weight: de.planned_weight != null ? de.planned_weight : '',
+        planned_duration_sec: de.planned_duration_sec != null ? de.planned_duration_sec : '',
+        notes: de.notes != null ? de.notes : '',
+        warmup: de.warmup ? 1 : 0,
+        main: de.main ? 1 : 0,
+        rest_hint: de.rest_hint != null ? de.rest_hint : '',
+        band_hint: de.band_hint != null ? de.band_hint : '',
+      };
+    })
+    .filter(function(row){
+      return row.day_name && row.exercise_name;
+    });
 
   var syncId   = (typeof uuid==='function') ? uuid() : Math.random().toString(36).slice(2);
   var syncedAt = new Date().toISOString();
@@ -2212,16 +2273,36 @@ async function backgroundSync(db, opts) {
         History: historyRows,
         Exercises: exercisesRows,
         Notes: notesRows,
+        Groups: groupsRows,
+        WorkoutDays: workoutDaysRows,
+        DayExercises: dayExercisesRows,
       },
       meta: {
         sync_id: syncId,
         synced_at: syncedAt,
-        version: 'liftlog.sheettabs.v3',
-        tabs: ['History', 'Exercises', 'Notes'],
+        version: 'liftlog.sheettabs.v4',
+        tabs: ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'],
         columns: {
           History: ['timestamp', 'exercise', 'reps', 'sets'],
-          Exercises: ['exercise_name', 'group'],
+          Exercises: ['exercise_name', 'description', 'group'],
           Notes: ['timestamp', 'exercise', 'note'],
+          Groups: ['group_name', 'sort_order'],
+          WorkoutDays: ['day_name', 'group_name', 'sort_order'],
+          DayExercises: [
+            'day_name',
+            'group_name',
+            'position',
+            'exercise_name',
+            'planned_sets',
+            'planned_reps',
+            'planned_weight',
+            'planned_duration_sec',
+            'notes',
+            'warmup',
+            'main',
+            'rest_hint',
+            'band_hint'
+          ],
         },
       },
       syncLog: {
@@ -2231,11 +2312,14 @@ async function backgroundSync(db, opts) {
         history_rows: historyRows.length,
         exercises_rows: exercisesRows.length,
         notes_rows: notesRows.length,
+        groups_rows: groupsRows.length,
+        workoutdays_rows: workoutDaysRows.length,
+        dayexercises_rows: dayExercisesRows.length,
       },
     }
   };
 
-  var totalRaw = historyRows.length + exercisesRows.length + notesRows.length;
+  var totalRaw = historyRows.length + exercisesRows.length + notesRows.length + groupsRows.length + workoutDaysRows.length + dayExercisesRows.length;
   var debugBase = { action:action, time:new Date().toLocaleString(), records: totalRaw+' rows',
                     status:null, httpStatus:null, error:null };
 
@@ -2276,12 +2360,226 @@ async function backgroundSync(db, opts) {
   }
 }
 
+async function pullFromSheets(db, opts) {
+  opts = opts || {};
+  const onSuccess = opts.onSuccess || function(){};
+  const onFail    = opts.onFail    || function(){};
+
+  var controller = new AbortController();
+  var timer = setTimeout(function(){ controller.abort(); }, 30000);
+
+  try {
+    var url = SYNC_URL + (SYNC_URL.indexOf('?') >= 0 ? '&' : '?') + 'action=pull';
+    var res = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    var text = await res.text();
+    var json = null;
+    try { json = JSON.parse(text); } catch(e) {}
+
+    if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (text || '').slice(0, 80));
+    if (!json || json.error) throw new Error(json && json.error ? json.error : 'Invalid pull response');
+
+    var tables = (((json || {}).data || {}).tables) || {};
+    var exercisesRows   = tables.Exercises || [];
+    var notesRows       = tables.Notes || [];
+    var groupsRows      = tables.Groups || [];
+    var workoutDaysRows = tables.WorkoutDays || [];
+    var dayExercisesRows = tables.DayExercises || [];
+
+    var nextDb = structuredClone(db);
+
+    nextDb.exercises = nextDb.exercises || [];
+    nextDb.groups = nextDb.groups || [];
+    nextDb.workout_days = nextDb.workout_days || [];
+    nextDb.day_exercises = nextDb.day_exercises || [];
+    nextDb.notes_library = nextDb.notes_library || [];
+
+    var exByName = {};
+    nextDb.exercises.forEach(function(ex) {
+      var key = String(ex.name || '').trim().toLowerCase();
+      if (key) exByName[key] = ex;
+    });
+
+    exercisesRows.forEach(function(row) {
+      var name = String((row && row.exercise_name) || '').trim();
+      if (!name) return;
+      var key = name.toLowerCase();
+      var ex = exByName[key];
+      if (!ex) {
+        ex = {
+          id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
+          name: name,
+          description: '',
+          archived: 0,
+          created_at: Math.floor(Date.now() / 1000),
+        };
+        nextDb.exercises.push(ex);
+        exByName[key] = ex;
+      }
+      if (row.description != null && String(row.description).trim()) {
+        ex.description = String(row.description);
+      }
+      ex.archived = 0;
+    });
+
+    var existingGroupByName = {};
+    nextDb.groups.forEach(function(g) {
+      var key = String(g.name || '').trim().toLowerCase();
+      if (key) existingGroupByName[key] = g;
+    });
+
+    var newGroups = [];
+    var pulledGroupByName = {};
+    groupsRows.forEach(function(row, idx) {
+      var name = String((row && row.group_name) || '').trim();
+      if (!name) return;
+      var key = name.toLowerCase();
+      var g = existingGroupByName[key] || {
+        id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
+        created_at: Math.floor(Date.now() / 1000),
+      };
+      g.name = name;
+      g.sort_order = row.sort_order !== '' && row.sort_order != null ? Number(row.sort_order) : (idx + 1);
+      newGroups.push(g);
+      pulledGroupByName[key] = g;
+    });
+    nextDb.groups = newGroups;
+
+    var oldDays = nextDb.workout_days || [];
+    var existingDayByKey = {};
+    oldDays.forEach(function(d) {
+      var group = d.group_id ? nextDb.groups.find(function(g){ return g.id === d.group_id; }) : null;
+      var key = String(d.name || '').trim().toLowerCase() + '||' + String(group && group.name || '').trim().toLowerCase();
+      existingDayByKey[key] = d;
+    });
+
+    var newWorkoutDays = [];
+    var pulledDayByKey = {};
+    workoutDaysRows.forEach(function(row, idx) {
+      var dayName = String((row && row.day_name) || '').trim();
+      var groupName = String((row && row.group_name) || '').trim();
+      if (!dayName) return;
+
+      var group = groupName ? pulledGroupByName[groupName.toLowerCase()] : null;
+      var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
+      var day = existingDayByKey[dayKey] || {
+        id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
+        created_at: Math.floor(Date.now() / 1000),
+      };
+
+      day.name = dayName;
+      day.group_id = group ? group.id : null;
+      day.sort_order = row.sort_order !== '' && row.sort_order != null ? Number(row.sort_order) : (idx + 1);
+
+      newWorkoutDays.push(day);
+      pulledDayByKey[dayKey] = day;
+    });
+    nextDb.workout_days = newWorkoutDays;
+
+    var newDayExercises = [];
+    dayExercisesRows
+      .slice()
+      .sort(function(a,b){
+        var ak = String((a && a.day_name) || '') + '||' + String((a && a.group_name) || '');
+        var bk = String((b && b.day_name) || '') + '||' + String((b && b.group_name) || '');
+        if (ak === bk) return Number(a.position || 0) - Number(b.position || 0);
+        return ak.localeCompare(bk);
+      })
+      .forEach(function(row) {
+        var dayName = String((row && row.day_name) || '').trim();
+        var groupName = String((row && row.group_name) || '').trim();
+        var exerciseName = String((row && row.exercise_name) || '').trim();
+        if (!dayName || !exerciseName) return;
+
+        var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
+        var day = pulledDayByKey[dayKey];
+        var ex = exByName[exerciseName.toLowerCase()];
+        if (!day || !ex) return;
+
+        newDayExercises.push({
+          id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
+          day_id: day.id,
+          exercise_id: ex.id,
+          position: row.position !== '' && row.position != null ? Number(row.position) : (newDayExercises.length + 1),
+          planned_sets: row.planned_sets !== '' && row.planned_sets != null ? Number(row.planned_sets) : null,
+          planned_reps: row.planned_reps != null ? String(row.planned_reps) : '',
+          planned_weight: row.planned_weight != null ? String(row.planned_weight) : '',
+          planned_duration_sec: row.planned_duration_sec !== '' && row.planned_duration_sec != null ? Number(row.planned_duration_sec) : null,
+          notes: row.notes != null ? String(row.notes) : '',
+          warmup: String(row.warmup || '') === '1' || String(row.warmup || '').toLowerCase() === 'true',
+          main: String(row.main || '') === '1' || String(row.main || '').toLowerCase() === 'true',
+          rest_hint: row.rest_hint != null ? String(row.rest_hint) : '',
+          band_hint: row.band_hint != null ? String(row.band_hint) : '',
+        });
+      });
+    nextDb.day_exercises = newDayExercises;
+
+    var noteSeen = {};
+    nextDb.notes_library.forEach(function(n) {
+      var key = [
+        String(n.exercise_id || ''),
+        String(n.text || '').trim().toLowerCase()
+      ].join('||');
+      noteSeen[key] = true;
+    });
+
+    notesRows.forEach(function(row) {
+      var exName = String((row && row.exercise) || '').trim();
+      var noteText = String((row && row.note) || '').trim();
+      if (!exName || !noteText) return;
+
+      var ex = exByName[exName.toLowerCase()];
+      if (!ex) return;
+
+      var noteKey = [String(ex.id), noteText.toLowerCase()].join('||');
+      if (noteSeen[noteKey]) return;
+
+      nextDb.notes_library.push({
+        id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
+        exercise_id: ex.id,
+        text: noteText,
+        created_at: Math.floor(Date.now() / 1000),
+      });
+      noteSeen[noteKey] = true;
+    });
+
+    var ts = new Date().toLocaleString();
+    localStorage.setItem('liftlog.last_pull', ts);
+
+    onSuccess(nextDb, {
+      pulled: {
+        exercises: exercisesRows.length,
+        groups: groupsRows.length,
+        workoutDays: workoutDaysRows.length,
+        dayExercises: dayExercisesRows.length,
+        notes: notesRows.length,
+      },
+      timestamp: ts,
+    });
+
+    return { ok: true, db: nextDb };
+  } catch (err) {
+    clearTimeout(timer);
+    var msg = err && err.name === 'AbortError' ? 'Timed out after 30s' : (err && err.message ? err.message : String(err));
+    onFail(msg);
+    return { ok: false, error: msg };
+  }
+}
+
 function SettingsPage() {
-  const { db, showToast } = useApp();
+  const { db, setDb, showToast } = useApp();
   const [syncing,     setSyncing]     = useState(false);
+  const [pulling,     setPulling]     = useState(false);
   const [syncStatus,  setSyncStatus]  = useState('idle');
   const [lastSync,    setLastSync]    = useState(function() {
     try { return localStorage.getItem('liftlog.last_sync') || null; } catch(e) { return null; }
+  });
+  const [lastPull,    setLastPull]    = useState(function() {
+    try { return localStorage.getItem('liftlog.last_pull') || null; } catch(e) { return null; }
   });
   const [pendingSync, setPendingSync] = useState(function() {
     try { return localStorage.getItem(PENDING_SYNC_KEY) === '1'; } catch(e) { return false; }
@@ -2290,7 +2588,9 @@ function SettingsPage() {
   const doManualSync = async function(action, successMsg) {
     action     = action     || 'manual-push';
     successMsg = successMsg || 'Synced ✓';
-    setSyncing(true); setSyncStatus('syncing');
+    setSyncing(true);
+    setSyncStatus('syncing');
+
     await backgroundSync(db, {
       action: action,
       onSuccess: function(ts) {
@@ -2305,13 +2605,44 @@ function SettingsPage() {
         showToast('Sync failed: ' + msg);
       },
     });
+
     setSyncing(false);
   };
 
-  const pushToSheets = function() { doManualSync('manual-push', 'Saved to Google Sheets ✓'); };
+  const pushToSheets = function() {
+    doManualSync('manual-push', 'Saved plans/history to Google Sheets ✓');
+  };
+
+  const pullFromSheetsNow = async function() {
+    var ok = window.confirm(
+      'Pull latest spreadsheet-backed plans into this device?\n\n' +
+      'This will replace local groups, workout days, and planned day exercises with the spreadsheet version.\n' +
+      'Exercises will be merged/updated by name.\n' +
+      'Workout history and calendar data on this phone will stay untouched.'
+    );
+    if (!ok) return;
+
+    setPulling(true);
+    setSyncStatus('syncing');
+
+    await pullFromSheets(db, {
+      onSuccess: function(nextDb, info) {
+        setDb(nextDb);
+        setLastPull(info.timestamp);
+        setSyncStatus('ok');
+        showToast('Pulled plans from Google Sheets ✓');
+      },
+      onFail: function(msg) {
+        setSyncStatus('error');
+        showToast('Pull failed: ' + msg);
+      },
+    });
+
+    setPulling(false);
+  };
 
   const statusColor = { idle: 'text-neutral-400', syncing: 'text-yellow-500', ok: 'text-green-600', error: 'text-red-500' };
-  const statusLabel = { idle: '', syncing: 'Syncing…', ok: 'Synced', error: 'Sync error' };
+  const statusLabel = { idle: '', syncing: 'Working…', ok: 'Done', error: 'Sync error' };
 
   return (
     <PageShell title="Settings">
@@ -2328,22 +2659,37 @@ function SettingsPage() {
               )}
             </div>
           </div>
-          <p className="text-xs text-neutral-400 mb-1">Auto-syncs to Google Sheets when you finish a workout.</p>
-          {lastSync && <p className="text-xs text-neutral-400 mb-2">Last sync: {lastSync}</p>}
-          <Button className="w-full text-xs mb-3" onClick={pushToSheets} disabled={syncing}>
+
+          <p className="text-xs text-neutral-400 mb-1">
+            Phone workout history stays local. Push/pull is mainly for exercises and workout plans.
+          </p>
+
+          {lastSync && <p className="text-xs text-neutral-400 mb-1">Last push: {lastSync}</p>}
+          {lastPull && <p className="text-xs text-neutral-400 mb-2">Last pull: {lastPull}</p>}
+
+          <Button className="w-full text-xs mb-2" onClick={pushToSheets} disabled={syncing || pulling}>
             {syncing ? '…' : '⬆'} Push now
           </Button>
+
+          <Button
+            variant="outline"
+            className="w-full text-xs mb-3"
+            onClick={pullFromSheetsNow}
+            disabled={syncing || pulling}
+          >
+            {pulling ? '…' : '⬇'} Pull now
+          </Button>
+
           <div className="text-xs text-neutral-500 space-y-1">
-            <p>History tab: timestamp, exercise, reps, sets.</p>
-            <p>Exercises tab: exercise name, group.</p>
-            <p>Notes tab: timestamp, exercise, note.</p>
+            <p>Push sends history, exercises, notes, groups, workout days, and planned day exercises.</p>
+            <p>Pull restores groups, workout days, planned day exercises, exercises, and notes.</p>
+            <p>Pull does not replace sessions, session logs, calendar history, or completed workout data on this phone.</p>
           </div>
         </Card>
       </div>
     </PageShell>
   );
 }
-
 /* ========================================================================== */
 /* ROUTER + ROOT                                                                */
 /* ========================================================================== */
