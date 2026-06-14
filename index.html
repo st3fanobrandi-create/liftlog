@@ -2120,6 +2120,11 @@ async function backgroundSync(db, opts) {
   const action    = opts.action    || 'auto';
   const onSuccess = opts.onSuccess || function(){};
   const onFail    = opts.onFail    || function(){};
+  const device    = opts.device    || 'phone'; // 'phone' or 'computer'
+
+  function norm(v) {
+    return String(v == null ? '' : v).trim().toLowerCase();
+  }
 
   const finishedSessions = (db.sessions || []).filter(function(s){ return s.is_finished; });
   const sortedSessions   = finishedSessions.slice().sort(function(a,b){ return (b.finished_at||0)-(a.finished_at||0); });
@@ -2135,47 +2140,49 @@ async function backgroundSync(db, opts) {
   var historyRows = [];
   var notesRows = [];
 
-  sortedSessions.forEach(function(s) {
-    var sessionTimestamp = s.finished_at ? new Date(s.finished_at * 1000).toISOString() : '';
-    (db.session_exercises || []).filter(function(se){ return se.session_id === s.id; }).forEach(function(se) {
-      var ex = exercisesById[se.exercise_id] || null;
-      var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
-      var completedSets = sets.filter(function(ss){ return !!ss.completed; });
-      if (!completedSets.length) {
-        historyRows.push({
-          timestamp: sessionTimestamp,
-          exercise: ex ? ex.name : '?',
-          reps: se.planned_reps != null ? se.planned_reps : '',
-          sets: sets.length || '',
-        });
-      } else {
-        historyRows.push({
-          timestamp: sessionTimestamp,
-          exercise: ex ? ex.name : '?',
-          reps: completedSets.map(function(ss){
-            return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
-          }).filter(function(v){ return v !== ''; }).join(', '),
-          sets: completedSets.length,
-        });
-      }
-      if (se.session_note && se.session_note.trim()) {
-        notesRows.push({
-          timestamp: sessionTimestamp,
-          exercise: ex ? ex.name : '?',
-          note: se.session_note.trim(),
-        });
-      }
+  if (device !== 'computer') {
+    sortedSessions.forEach(function(s) {
+      var sessionTimestamp = s.finished_at ? new Date(s.finished_at * 1000).toISOString() : '';
+      (db.session_exercises || []).filter(function(se){ return se.session_id === s.id; }).forEach(function(se) {
+        var ex = exercisesById[se.exercise_id] || null;
+        var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
+        var completedSets = sets.filter(function(ss){ return !!ss.completed; });
+        if (!completedSets.length) {
+          historyRows.push({
+            timestamp: sessionTimestamp,
+            exercise: ex ? ex.name : '?',
+            reps: se.planned_reps != null ? se.planned_reps : '',
+            sets: sets.length || '',
+          });
+        } else {
+          historyRows.push({
+            timestamp: sessionTimestamp,
+            exercise: ex ? ex.name : '?',
+            reps: completedSets.map(function(ss){
+              return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
+            }).filter(function(v){ return v !== ''; }).join(', '),
+            sets: completedSets.length,
+          });
+        }
+        if (se.session_note && se.session_note.trim()) {
+          notesRows.push({
+            timestamp: sessionTimestamp,
+            exercise: ex ? ex.name : '?',
+            note: se.session_note.trim(),
+          });
+        }
+      });
     });
-  });
 
-  (db.notes_library || []).forEach(function(n) {
-    var ex = n.exercise_id ? exercisesById[n.exercise_id] : null;
-    notesRows.push({
-      timestamp: '',
-      exercise: ex ? ex.name : '',
-      note: n.text || '',
+    (db.notes_library || []).forEach(function(n) {
+      var ex = n.exercise_id ? exercisesById[n.exercise_id] : null;
+      notesRows.push({
+        timestamp: '',
+        exercise: ex ? ex.name : '',
+        note: n.text || '',
+      });
     });
-  });
+  }
 
   var exerciseGroupMap = {};
   (db.day_exercises || []).forEach(function(de) {
@@ -2183,7 +2190,7 @@ async function backgroundSync(db, opts) {
     var day = daysById[de.day_id];
     var group = day && day.group_id ? groupsById[day.group_id] : null;
     if (!ex) return;
-    var key = (ex.name || '').trim().toLowerCase();
+    var key = norm(ex.name);
     if (!key) return;
     if (!exerciseGroupMap[key]) {
       exerciseGroupMap[key] = {
@@ -2201,7 +2208,7 @@ async function backgroundSync(db, opts) {
     }
   });
   (db.exercises || []).forEach(function(ex) {
-    var key = (ex.name || '').trim().toLowerCase();
+    var key = norm(ex.name);
     if (!key) return;
     if (!exerciseGroupMap[key]) {
       exerciseGroupMap[key] = {
@@ -2223,7 +2230,7 @@ async function backgroundSync(db, opts) {
       };
     });
 
-  var workoutDaysRows = (db.workout_days || [])
+  var workoutDaysRowsRaw = (db.workout_days || [])
     .slice()
     .sort(function(a,b){ return (a.sort_order || 0) - (b.sort_order || 0); })
     .map(function(d){
@@ -2235,7 +2242,17 @@ async function backgroundSync(db, opts) {
       };
     });
 
-  var dayExercisesRows = (db.day_exercises || [])
+  var seenWorkoutDayKeys = {};
+  var workoutDaysRows = [];
+  workoutDaysRowsRaw.forEach(function(row) {
+    var key = norm(row.group_name) + '||' + norm(row.day_name);
+    if (!norm(row.day_name)) return;
+    if (seenWorkoutDayKeys[key]) return;
+    seenWorkoutDayKeys[key] = true;
+    workoutDaysRows.push(row);
+  });
+
+  var dayExercisesRowsRaw = (db.day_exercises || [])
     .slice()
     .sort(function(a,b){
       if ((a.day_id || '') === (b.day_id || '')) return (a.position || 0) - (b.position || 0);
@@ -2265,50 +2282,76 @@ async function backgroundSync(db, opts) {
       return row.day_name && row.exercise_name;
     });
 
+  var seenDayExerciseKeys = {};
+  var dayExercisesRows = [];
+  dayExercisesRowsRaw.forEach(function(row) {
+    var key = [
+      norm(row.group_name),
+      norm(row.day_name),
+      String(row.position == null ? '' : row.position),
+      norm(row.exercise_name)
+    ].join('||');
+    if (seenDayExerciseKeys[key]) return;
+    seenDayExerciseKeys[key] = true;
+    dayExercisesRows.push(row);
+  });
+
+  var tables = {
+    Exercises: exercisesRows,
+    Groups: groupsRows,
+    WorkoutDays: workoutDaysRows,
+    DayExercises: dayExercisesRows,
+  };
+
+  var columns = {
+    Exercises: ['exercise_name', 'description', 'group'],
+    Groups: ['group_name', 'sort_order'],
+    WorkoutDays: ['day_name', 'group_name', 'sort_order'],
+    DayExercises: [
+      'day_name',
+      'group_name',
+      'position',
+      'exercise_name',
+      'planned_sets',
+      'planned_reps',
+      'planned_weight',
+      'planned_duration_sec',
+      'notes',
+      'warmup',
+      'main',
+      'rest_hint',
+      'band_hint'
+    ],
+  };
+
+  var tabList = ['Exercises', 'Groups', 'WorkoutDays', 'DayExercises'];
+
+  if (device !== 'computer') {
+    tables.History = historyRows;
+    tables.Notes = notesRows;
+    columns.History = ['timestamp', 'exercise', 'reps', 'sets'];
+    columns.Notes = ['timestamp', 'exercise', 'note'];
+    tabList = ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'];
+  }
+
   var syncId   = (typeof uuid==='function') ? uuid() : Math.random().toString(36).slice(2);
   var syncedAt = new Date().toISOString();
   var payload = {
     data: {
-      tables: {
-        History: historyRows,
-        Exercises: exercisesRows,
-        Notes: notesRows,
-        Groups: groupsRows,
-        WorkoutDays: workoutDaysRows,
-        DayExercises: dayExercisesRows,
-      },
+      tables: tables,
       meta: {
         sync_id: syncId,
         synced_at: syncedAt,
-        version: 'liftlog.sheettabs.v4',
-        tabs: ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'],
-        columns: {
-          History: ['timestamp', 'exercise', 'reps', 'sets'],
-          Exercises: ['exercise_name', 'description', 'group'],
-          Notes: ['timestamp', 'exercise', 'note'],
-          Groups: ['group_name', 'sort_order'],
-          WorkoutDays: ['day_name', 'group_name', 'sort_order'],
-          DayExercises: [
-            'day_name',
-            'group_name',
-            'position',
-            'exercise_name',
-            'planned_sets',
-            'planned_reps',
-            'planned_weight',
-            'planned_duration_sec',
-            'notes',
-            'warmup',
-            'main',
-            'rest_hint',
-            'band_hint'
-          ],
-        },
+        version: 'liftlog.sheettabs.v5',
+        device: device,
+        tabs: tabList,
+        columns: columns,
       },
       syncLog: {
         sync_id: syncId,
         synced_at: syncedAt,
         action: action,
+        device: device,
         history_rows: historyRows.length,
         exercises_rows: exercisesRows.length,
         notes_rows: notesRows.length,
@@ -2319,8 +2362,12 @@ async function backgroundSync(db, opts) {
     }
   };
 
-  var totalRaw = historyRows.length + exercisesRows.length + notesRows.length + groupsRows.length + workoutDaysRows.length + dayExercisesRows.length;
-  var debugBase = { action:action, time:new Date().toLocaleString(), records: totalRaw+' rows',
+  var totalRaw = 0;
+  Object.keys(tables).forEach(function(k) {
+    totalRaw += (tables[k] || []).length;
+  });
+
+  var debugBase = { action:action, device:device, time:new Date().toLocaleString(), records: totalRaw+' rows',
                     status:null, httpStatus:null, error:null };
 
   var controller = new AbortController();
@@ -2345,7 +2392,7 @@ async function backgroundSync(db, opts) {
     localStorage.setItem('liftlog.last_sync', ts);
     var dbg = Object.assign({}, debugBase, { status:'ok', httpStatus:res.status });
     localStorage.setItem(SYNC_DEBUG_KEY, JSON.stringify(dbg));
-    console.log('[LiftLog Sync] OK —', totalRaw, 'rows, action:', action);
+    console.log('[LiftLog Sync] OK —', totalRaw, 'rows, action:', action, 'device:', device);
     onSuccess(ts);
     return { ok:true };
   } catch(err) {
@@ -2364,6 +2411,10 @@ async function pullFromSheets(db, opts) {
   opts = opts || {};
   const onSuccess = opts.onSuccess || function(){};
   const onFail    = opts.onFail    || function(){};
+
+  function norm(v) {
+    return String(v == null ? '' : v).trim().toLowerCase();
+  }
 
   var controller = new AbortController();
   var timer = setTimeout(function(){ controller.abort(); }, 30000);
@@ -2384,10 +2435,10 @@ async function pullFromSheets(db, opts) {
     if (!json || json.error) throw new Error(json && json.error ? json.error : 'Invalid pull response');
 
     var tables = (((json || {}).data || {}).tables) || {};
-    var exercisesRows   = tables.Exercises || [];
-    var notesRows       = tables.Notes || [];
-    var groupsRows      = tables.Groups || [];
-    var workoutDaysRows = tables.WorkoutDays || [];
+    var exercisesRows    = tables.Exercises || [];
+    var notesRows        = tables.Notes || [];
+    var groupsRows       = tables.Groups || [];
+    var workoutDaysRows  = tables.WorkoutDays || [];
     var dayExercisesRows = tables.DayExercises || [];
 
     var nextDb = structuredClone(db);
@@ -2400,14 +2451,14 @@ async function pullFromSheets(db, opts) {
 
     var exByName = {};
     nextDb.exercises.forEach(function(ex) {
-      var key = String(ex.name || '').trim().toLowerCase();
+      var key = norm(ex.name);
       if (key) exByName[key] = ex;
     });
 
     exercisesRows.forEach(function(row) {
       var name = String((row && row.exercise_name) || '').trim();
       if (!name) return;
-      var key = name.toLowerCase();
+      var key = norm(name);
       var ex = exByName[key];
       if (!ex) {
         ex = {
@@ -2428,22 +2479,27 @@ async function pullFromSheets(db, opts) {
 
     var existingGroupByName = {};
     nextDb.groups.forEach(function(g) {
-      var key = String(g.name || '').trim().toLowerCase();
+      var key = norm(g.name);
       if (key) existingGroupByName[key] = g;
     });
 
     var newGroups = [];
     var pulledGroupByName = {};
+    var seenGroupKeys = {};
     groupsRows.forEach(function(row, idx) {
       var name = String((row && row.group_name) || '').trim();
       if (!name) return;
-      var key = name.toLowerCase();
+      var key = norm(name);
+      if (seenGroupKeys[key]) return;
+      seenGroupKeys[key] = true;
+
       var g = existingGroupByName[key] || {
         id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
         created_at: Math.floor(Date.now() / 1000),
       };
       g.name = name;
       g.sort_order = row.sort_order !== '' && row.sort_order != null ? Number(row.sort_order) : (idx + 1);
+
       newGroups.push(g);
       pulledGroupByName[key] = g;
     });
@@ -2453,19 +2509,23 @@ async function pullFromSheets(db, opts) {
     var existingDayByKey = {};
     oldDays.forEach(function(d) {
       var group = d.group_id ? nextDb.groups.find(function(g){ return g.id === d.group_id; }) : null;
-      var key = String(d.name || '').trim().toLowerCase() + '||' + String(group && group.name || '').trim().toLowerCase();
-      existingDayByKey[key] = d;
+      var key = norm(d.name) + '||' + norm(group && group.name);
+      if (key) existingDayByKey[key] = d;
     });
 
     var newWorkoutDays = [];
     var pulledDayByKey = {};
+    var seenWorkoutDayKeys = {};
     workoutDaysRows.forEach(function(row, idx) {
       var dayName = String((row && row.day_name) || '').trim();
       var groupName = String((row && row.group_name) || '').trim();
       if (!dayName) return;
 
-      var group = groupName ? pulledGroupByName[groupName.toLowerCase()] : null;
-      var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
+      var group = groupName ? pulledGroupByName[norm(groupName)] : null;
+      var dayKey = norm(dayName) + '||' + norm(groupName);
+      if (seenWorkoutDayKeys[dayKey]) return;
+      seenWorkoutDayKeys[dayKey] = true;
+
       var day = existingDayByKey[dayKey] || {
         id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
         created_at: Math.floor(Date.now() / 1000),
@@ -2481,11 +2541,12 @@ async function pullFromSheets(db, opts) {
     nextDb.workout_days = newWorkoutDays;
 
     var newDayExercises = [];
+    var seenDayExerciseKeys = {};
     dayExercisesRows
       .slice()
       .sort(function(a,b){
-        var ak = String((a && a.day_name) || '') + '||' + String((a && a.group_name) || '');
-        var bk = String((b && b.day_name) || '') + '||' + String((b && b.group_name) || '');
+        var ak = norm((a && a.day_name) || '') + '||' + norm((a && a.group_name) || '');
+        var bk = norm((b && b.day_name) || '') + '||' + norm((b && b.group_name) || '');
         if (ak === bk) return Number(a.position || 0) - Number(b.position || 0);
         return ak.localeCompare(bk);
       })
@@ -2495,10 +2556,18 @@ async function pullFromSheets(db, opts) {
         var exerciseName = String((row && row.exercise_name) || '').trim();
         if (!dayName || !exerciseName) return;
 
-        var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
+        var dayKey = norm(dayName) + '||' + norm(groupName);
         var day = pulledDayByKey[dayKey];
-        var ex = exByName[exerciseName.toLowerCase()];
+        var ex = exByName[norm(exerciseName)];
         if (!day || !ex) return;
+
+        var deKey = [
+          dayKey,
+          String(row.position !== '' && row.position != null ? Number(row.position) : ''),
+          norm(exerciseName)
+        ].join('||');
+        if (seenDayExerciseKeys[deKey]) return;
+        seenDayExerciseKeys[deKey] = true;
 
         newDayExercises.push({
           id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
@@ -2522,7 +2591,7 @@ async function pullFromSheets(db, opts) {
     nextDb.notes_library.forEach(function(n) {
       var key = [
         String(n.exercise_id || ''),
-        String(n.text || '').trim().toLowerCase()
+        norm(n.text || '')
       ].join('||');
       noteSeen[key] = true;
     });
@@ -2532,10 +2601,10 @@ async function pullFromSheets(db, opts) {
       var noteText = String((row && row.note) || '').trim();
       if (!exName || !noteText) return;
 
-      var ex = exByName[exName.toLowerCase()];
+      var ex = exByName[norm(exName)];
       if (!ex) return;
 
-      var noteKey = [String(ex.id), noteText.toLowerCase()].join('||');
+      var noteKey = [String(ex.id), norm(noteText)].join('||');
       if (noteSeen[noteKey]) return;
 
       nextDb.notes_library.push({
