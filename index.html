@@ -944,6 +944,103 @@ function BulkExerciseImportModal({ open, onClose }) {
     </Modal>
   );
 }
+function ExerciseEditor({ open, value, onClose, onSave }) {
+  const [v, setV] = useState(value || {});
+  useEffect(() => { setV(value || {}); }, [value]);
+
+  if (!open) return null;
+
+  const isTime = (v.kind || 'reps') === 'time';
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={v.id ? 'Edit exercise' : 'New exercise'}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={() => onSave(v)} disabled={!(v.name || '').trim()}>Save</Button>
+        </>
+      }
+    >
+      <Label>Name</Label>
+      <Input
+        value={v.name || ''}
+        onChange={e => setV({ ...v, name: e.target.value })}
+        autoFocus
+      />
+
+      <div className="h-3" />
+
+      <Label>Type</Label>
+      <Select
+        value={v.kind || 'reps'}
+        onChange={e => setV({ ...v, kind: e.target.value, bilateral: false, use_band: false })}
+      >
+        <option value="reps">Reps (sets × reps × weight)</option>
+        <option value="time">Time (duration)</option>
+      </Select>
+
+      {isTime && (
+        <>
+          <div className="h-3" />
+          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={!!v.bilateral}
+              onChange={e => setV({ ...v, bilateral: e.target.checked })}
+              className="w-4 h-4 accent-green-600"
+            />
+            Bilateral (separate L / R timers)
+          </label>
+        </>
+      )}
+
+      {!isTime && (
+        <>
+          <div className="h-3" />
+          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={!!v.use_band}
+              onChange={e => setV({ ...v, use_band: e.target.checked })}
+              className="w-4 h-4 accent-green-600"
+            />
+            Band exercise (log band type instead of weight)
+          </label>
+        </>
+      )}
+
+      <div className="h-3" />
+
+      <Label>Description (optional)</Label>
+      <Textarea
+        rows="2"
+        value={v.description || ''}
+        onChange={e => setV({ ...v, description: e.target.value })}
+      />
+
+      <div className="h-3" />
+
+      <Label>Persistent notes (shown in every session)</Label>
+      <Textarea
+        rows="2"
+        value={v.persistent_notes || ''}
+        onChange={e => setV({ ...v, persistent_notes: e.target.value })}
+      />
+
+      <div className="h-3" />
+
+      <Label>YouTube URL (optional)</Label>
+      <Input
+        value={v.youtube_url || ''}
+        onChange={e => setV({ ...v, youtube_url: e.target.value })}
+        placeholder="https://…"
+      />
+    </Modal>
+  );
+}
 /* ========================================================================== */
 /* DAY EDITOR — list + reorder + supersets + add exercise                       */
 /* ========================================================================== */
