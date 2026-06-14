@@ -694,23 +694,41 @@ function parseBool(v) {
 
 function parseBulkExercises(text) {
   const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  let dayName = '';
-  let groupName = '';
-  const items = [];
+  const blocks = [];
+  let current = null;
+
+  function ensureCurrent() {
+    if (!current) {
+      current = { dayName: '', groupName: '', items: [] };
+    }
+  }
+
+  function pushCurrentIfValid() {
+    if (current && current.dayName && current.groupName && current.items.length) {
+      blocks.push(current);
+    }
+    current = null;
+  }
 
   for (const line of lines) {
     if (line.toUpperCase().startsWith('DAY:')) {
-      dayName = line.slice(4).trim();
+      pushCurrentIfValid();
+      current = { dayName: line.slice(4).trim(), groupName: '', items: [] };
       continue;
     }
+
+    ensureCurrent();
+
     if (line.toUpperCase().startsWith('GROUP:')) {
-      groupName = line.slice(6).trim();
+      current.groupName = line.slice(6).trim();
       continue;
     }
+
     if (line.toUpperCase().startsWith('EXERCISE:')) {
       const rest = line.slice('EXERCISE:'.length).trim();
       const parts = rest.split('|').map(p => p.trim()).filter(Boolean);
       if (!parts.length) continue;
+
       const name = parts[0];
       const fields = {};
       for (let i = 1; i < parts.length; i++) {
@@ -721,7 +739,8 @@ function parseBulkExercises(text) {
         const v = rawV.trim();
         fields[k] = v;
       }
-      items.push({
+
+      current.items.push({
         name,
         sets: fields['sets'] || '',
         reps: fields['reps'] || '',
@@ -734,91 +753,121 @@ function parseBulkExercises(text) {
     }
   }
 
-  return { dayName, groupName, items };
+  pushCurrentIfValid();
+  return blocks;
 }
 
-function applyBulkExercises(d, parsed) {
-  const { dayName, groupName, items } = parsed;
-  if (!dayName || !groupName || !items.length) return d;
+function applyBulkExercises(d, parsedBlocks) {
+  if (!Array.isArray(parsedBlocks) || !parsedBlocks.length) return d;
 
   d.groups = d.groups || [];
   d.workout_days = d.workout_days || [];
   d.exercises = d.exercises || [];
   d.day_exercises = d.day_exercises || [];
 
-  let group = d.groups.find(g => (g.name || '').trim().toLowerCase() === groupName.trim().toLowerCase());
-  if (!group) {
-    group = { id: uuid(), name: groupName, sort_order: d.groups.reduce((m, g) => Math.max(m, g.sort_order || 0), 0) + 1 };
-    d.groups.push(group);
+  function norm(v) {
+    return String(v || '').trim().toLowerCase();
   }
 
-  let day = d.workout_days.find(w => (w.name || '').trim().toLowerCase() === dayName.trim().toLowerCase() && (w.group_id || null) === group.id);
-  if (!day) {
-    day = { id: uuid(), name: dayName, group_id: group.id, sort_order: d.workout_days.reduce((m, w) => Math.max(m, w.sort_order || 0), 0) + 1 };
-    d.workout_days.push(day);
+  function maxSort(rows) {
+    return rows.reduce((m, r) => Math.max(m, r.sort_order || 0), 0);
   }
 
   const exByName = new Map();
-  d.exercises.forEach(ex => exByName.set((ex.name || '').trim().toLowerCase(), ex));
-  const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
+  d.exercises.forEach(ex => exByName.set(norm(ex.name), ex));
 
-  items.forEach((item, idx) => {
-    const key = (item.name || '').trim().toLowerCase();
-    if (!key) return;
+  parsedBlocks.forEach(block => {
+    const dayName = String(block.dayName || '').trim();
+    const groupName = String(block.groupName || '').trim();
+    const items = Array.isArray(block.items) ? block.items : [];
 
-    let ex = exByName.get(key);
-    if (!ex) {
-      ex = {
+    if (!dayName || !groupName || !items.length) return;
+
+    let group = d.groups.find(g => norm(g.name) === norm(groupName));
+    if (!group) {
+      group = {
         id: uuid(),
-        name: item.name,
-        kind: 'reps',
-        description: item.notes || '',
-        persistent_notes: item.notes || '',
-        youtube_url: '',
-        archived: 0,
+        name: groupName,
+        sort_order: maxSort(d.groups) + 1,
       };
-      d.exercises.push(ex);
-      exByName.set(key, ex);
-    } else {
-      if (item.notes) ex.description = item.notes;
-      if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
+      d.groups.push(group);
     }
 
-    let de = dayExForDay.find(x => x.exercise_id === ex.id);
-    if (!de) {
-      de = {
+    let day = d.workout_days.find(w => norm(w.name) === norm(dayName) && (w.group_id || null) === group.id);
+    if (!day) {
+      const maxDaySortInGroup = d.workout_days
+        .filter(w => (w.group_id || null) === group.id)
+        .reduce((m, w) => Math.max(m, w.sort_order || 0), 0);
+
+      day = {
         id: uuid(),
-        day_id: day.id,
-        exercise_id: ex.id,
-        position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
-        planned_sets: 1,
-        planned_reps: null,
-        planned_weight: null,
-        planned_duration_sec: null,
-        notes: '',
-        warmup: 0,
-        main: 0,
-        superset_id: null,
-        rest_hint: null,
-        band_hint: null,
+        name: dayName,
+        group_id: group.id,
+        sort_order: maxDaySortInGroup + 1,
       };
-      d.day_exercises.push(de);
-      dayExForDay.push(de);
+      d.workout_days.push(day);
     }
 
-    if (item.sets) {
-      const first = parseInt(String(item.sets).split('-')[0], 10);
-      if (!isNaN(first)) de.planned_sets = first;
-    }
-    if (item.reps) de.planned_reps = item.reps;
-    if (item.band) {
-      de.band_hint = item.band;
-      if (!de.planned_weight) de.planned_weight = item.band;
-    }
-    if (item.rest) de.rest_hint = item.rest;
-    if (item.notes) de.notes = item.notes;
-    de.main = item.main ? 1 : 0;
-    de.warmup = item.warmup ? 1 : 0;
+    const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
+
+    items.forEach((item, idx) => {
+      const key = norm(item.name);
+      if (!key) return;
+
+      let ex = exByName.get(key);
+      if (!ex) {
+        ex = {
+          id: uuid(),
+          name: item.name,
+          kind: 'reps',
+          description: item.notes || '',
+          persistent_notes: item.notes || '',
+          youtube_url: '',
+          archived: 0,
+        };
+        d.exercises.push(ex);
+        exByName.set(key, ex);
+      } else {
+        if (item.notes) ex.description = item.notes;
+        if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
+      }
+
+      let de = dayExForDay.find(x => x.exercise_id === ex.id);
+      if (!de) {
+        de = {
+          id: uuid(),
+          day_id: day.id,
+          exercise_id: ex.id,
+          position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
+          planned_sets: 1,
+          planned_reps: null,
+          planned_weight: null,
+          planned_duration_sec: null,
+          notes: '',
+          warmup: 0,
+          main: 0,
+          superset_id: null,
+          rest_hint: null,
+          band_hint: null,
+        };
+        d.day_exercises.push(de);
+        dayExForDay.push(de);
+      }
+
+      if (item.sets) {
+        const first = parseInt(String(item.sets).split('-')[0], 10);
+        if (!isNaN(first)) de.planned_sets = first;
+      }
+      if (item.reps) de.planned_reps = item.reps;
+      if (item.band) {
+        de.band_hint = item.band;
+        if (!de.planned_weight) de.planned_weight = item.band;
+      }
+      if (item.rest) de.rest_hint = item.rest;
+      if (item.notes) de.notes = item.notes;
+      de.main = item.main ? 1 : 0;
+      de.warmup = item.warmup ? 1 : 0;
+    });
   });
 
   return d;
@@ -834,6 +883,11 @@ function BulkExerciseImportModal({ open, onClose }) {
     'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | rest=30s | notes=easy warmup | main=false | warmup=true',
     'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
     'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | rest=45s | notes=gently back and down | main=false | warmup=false',
+    '',
+    'DAY: Small Day E',
+    'GROUP: Shoulder Rehab',
+    'EXERCISE: Shoulder CARs | sets=1 | reps=5/side | rest=30s | notes=slow circles | main=false | warmup=true',
+    'EXERCISE: Sidelying ER | sets=2 | reps=12-15 | rest=45s | notes=control the lowering | main=true | warmup=false',
   ].join('\n');
 
   if (!open) return null;
@@ -851,8 +905,8 @@ function BulkExerciseImportModal({ open, onClose }) {
       showToast('Parse error: ' + e.message);
       return;
     }
-    if (!parsed.dayName || !parsed.groupName || parsed.items.length === 0) {
-      showToast('Need a DAY, a GROUP, and at least one EXERCISE line');
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      showToast('Need at least one DAY, one GROUP, and one EXERCISE line');
       return;
     }
     setBusy(true);
@@ -870,9 +924,9 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste text in the agreed format. Existing days and exercises will be merged and updated, without duplicates.</p>
+        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Existing days and exercises will be merged and updated, without duplicates.</p>
         <textarea
-          rows={10}
+          rows={12}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
           value={text}
           onChange={e => setText(e.target.value)}
@@ -890,41 +944,6 @@ function BulkExerciseImportModal({ open, onClose }) {
     </Modal>
   );
 }
-
-function ExerciseEditor({ open, value, onClose, onSave }) {
-  const [v, setV] = useState(value || {});
-  useEffect(() => { setV(value || {}); }, [value]);
-  if (!open) return null;
-  const isTime = (v.kind || 'reps') === 'time';
-  return (
-    <Modal open={open} onClose={onClose} title={v.id ? 'Edit exercise' : 'New exercise'}
-      footer={<>
-        <Button variant="outline" onClick={onClose}>Cancel</Button>
-        <Button onClick={() => onSave(v)} disabled={!(v.name || '').trim()}>Save</Button>
-      </>}>
-      <Label>Name</Label>
-      <Input value={v.name || ''} onChange={e => setV({ ...v, name: e.target.value })} autoFocus />
-      <div className="h-3" />
-      <Label>Type</Label>
-      <Select value={v.kind || 'reps'} onChange={e => setV({ ...v, kind: e.target.value, bilateral: false, use_band: false })}>
-        <option value="reps">Reps (sets × reps × weight)</option>
-        <option value="time">Time (duration)</option>
-      </Select>
-      {isTime && <><div className="h-3" /><label className="flex items-center gap-2 text-sm cursor-pointer select-none"><input type="checkbox" checked={!!v.bilateral} onChange={e => setV({ ...v, bilateral: e.target.checked })} className="w-4 h-4 accent-green-600" />Bilateral (separate L / R timers)</label></>}
-      {!isTime && <><div className="h-3" /><label className="flex items-center gap-2 text-sm cursor-pointer select-none"><input type="checkbox" checked={!!v.use_band} onChange={e => setV({ ...v, use_band: e.target.checked })} className="w-4 h-4 accent-green-600" />Band exercise (log band type instead of weight)</label></>}
-      <div className="h-3" />
-      <Label>Description (optional)</Label>
-      <Textarea rows="2" value={v.description || ''} onChange={e => setV({ ...v, description: e.target.value })} />
-      <div className="h-3" />
-      <Label>Persistent notes (shown in every session)</Label>
-      <Textarea rows="2" value={v.persistent_notes || ''} onChange={e => setV({ ...v, persistent_notes: e.target.value })} />
-      <div className="h-3" />
-      <Label>YouTube URL (optional)</Label>
-      <Input value={v.youtube_url || ''} onChange={e => setV({ ...v, youtube_url: e.target.value })} placeholder="https://…" />
-    </Modal>
-  );
-}
-
 /* ========================================================================== */
 /* DAY EDITOR — list + reorder + supersets + add exercise                       */
 /* ========================================================================== */
