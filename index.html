@@ -46,7 +46,7 @@
 <body>
 <div id="root"></div>
 
-<script type="text/babel" data-presets="env,react">
+<script type="text/babel" data-type="module" data-presets="react">
 const { useState, useEffect, useMemo, useRef, useCallback, createContext, useContext, Fragment } = React;
 
 /* ========================================================================== */
@@ -108,7 +108,7 @@ function AppProvider({ children }) {
 
   // Retry any pending sync on app open (non-blocking, 3s delay)
   useEffect(() => {
-    if (localStorage.getItem(PENDINGSYNCKEY) === '1') {
+    if (localStorage.getItem(PENDING_SYNC_KEY) === '1') {
       setTimeout(function() {
         var freshDb;
         try { freshDb = JSON.parse(localStorage.getItem('liftlog.v1') || '{}'); } catch(e) { freshDb = {}; }
@@ -694,41 +694,23 @@ function parseBool(v) {
 
 function parseBulkExercises(text) {
   const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  const blocks = [];
-  let current = null;
-
-  function ensureCurrent() {
-    if (!current) {
-      current = { dayName: '', groupName: '', items: [] };
-    }
-  }
-
-  function pushCurrentIfValid() {
-    if (current && current.dayName && current.groupName && current.items.length) {
-      blocks.push(current);
-    }
-    current = null;
-  }
+  let dayName = '';
+  let groupName = '';
+  const items = [];
 
   for (const line of lines) {
     if (line.toUpperCase().startsWith('DAY:')) {
-      pushCurrentIfValid();
-      current = { dayName: line.slice(4).trim(), groupName: '', items: [] };
+      dayName = line.slice(4).trim();
       continue;
     }
-
-    ensureCurrent();
-
     if (line.toUpperCase().startsWith('GROUP:')) {
-      current.groupName = line.slice(6).trim();
+      groupName = line.slice(6).trim();
       continue;
     }
-
     if (line.toUpperCase().startsWith('EXERCISE:')) {
       const rest = line.slice('EXERCISE:'.length).trim();
       const parts = rest.split('|').map(p => p.trim()).filter(Boolean);
       if (!parts.length) continue;
-
       const name = parts[0];
       const fields = {};
       for (let i = 1; i < parts.length; i++) {
@@ -739,8 +721,7 @@ function parseBulkExercises(text) {
         const v = rawV.trim();
         fields[k] = v;
       }
-
-      current.items.push({
+      items.push({
         name,
         sets: fields['sets'] || '',
         reps: fields['reps'] || '',
@@ -753,121 +734,91 @@ function parseBulkExercises(text) {
     }
   }
 
-  pushCurrentIfValid();
-  return blocks;
+  return { dayName, groupName, items };
 }
 
-function applyBulkExercises(d, parsedBlocks) {
-  if (!Array.isArray(parsedBlocks) || !parsedBlocks.length) return d;
+function applyBulkExercises(d, parsed) {
+  const { dayName, groupName, items } = parsed;
+  if (!dayName || !groupName || !items.length) return d;
 
   d.groups = d.groups || [];
   d.workout_days = d.workout_days || [];
   d.exercises = d.exercises || [];
   d.day_exercises = d.day_exercises || [];
 
-  function norm(v) {
-    return String(v || '').trim().toLowerCase();
+  let group = d.groups.find(g => (g.name || '').trim().toLowerCase() === groupName.trim().toLowerCase());
+  if (!group) {
+    group = { id: uuid(), name: groupName, sort_order: d.groups.reduce((m, g) => Math.max(m, g.sort_order || 0), 0) + 1 };
+    d.groups.push(group);
   }
 
-  function maxSort(rows) {
-    return rows.reduce((m, r) => Math.max(m, r.sort_order || 0), 0);
+  let day = d.workout_days.find(w => (w.name || '').trim().toLowerCase() === dayName.trim().toLowerCase() && (w.group_id || null) === group.id);
+  if (!day) {
+    day = { id: uuid(), name: dayName, group_id: group.id, sort_order: d.workout_days.reduce((m, w) => Math.max(m, w.sort_order || 0), 0) + 1 };
+    d.workout_days.push(day);
   }
 
   const exByName = new Map();
-  d.exercises.forEach(ex => exByName.set(norm(ex.name), ex));
+  d.exercises.forEach(ex => exByName.set((ex.name || '').trim().toLowerCase(), ex));
+  const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
 
-  parsedBlocks.forEach(block => {
-    const dayName = String(block.dayName || '').trim();
-    const groupName = String(block.groupName || '').trim();
-    const items = Array.isArray(block.items) ? block.items : [];
+  items.forEach((item, idx) => {
+    const key = (item.name || '').trim().toLowerCase();
+    if (!key) return;
 
-    if (!dayName || !groupName || !items.length) return;
-
-    let group = d.groups.find(g => norm(g.name) === norm(groupName));
-    if (!group) {
-      group = {
+    let ex = exByName.get(key);
+    if (!ex) {
+      ex = {
         id: uuid(),
-        name: groupName,
-        sort_order: maxSort(d.groups) + 1,
+        name: item.name,
+        kind: 'reps',
+        description: item.notes || '',
+        persistent_notes: item.notes || '',
+        youtube_url: '',
+        archived: 0,
       };
-      d.groups.push(group);
+      d.exercises.push(ex);
+      exByName.set(key, ex);
+    } else {
+      if (item.notes) ex.description = item.notes;
+      if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
     }
 
-    let day = d.workout_days.find(w => norm(w.name) === norm(dayName) && (w.group_id || null) === group.id);
-    if (!day) {
-      const maxDaySortInGroup = d.workout_days
-        .filter(w => (w.group_id || null) === group.id)
-        .reduce((m, w) => Math.max(m, w.sort_order || 0), 0);
-
-      day = {
+    let de = dayExForDay.find(x => x.exercise_id === ex.id);
+    if (!de) {
+      de = {
         id: uuid(),
-        name: dayName,
-        group_id: group.id,
-        sort_order: maxDaySortInGroup + 1,
+        day_id: day.id,
+        exercise_id: ex.id,
+        position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
+        planned_sets: 1,
+        planned_reps: null,
+        planned_weight: null,
+        planned_duration_sec: null,
+        notes: '',
+        warmup: 0,
+        main: 0,
+        superset_id: null,
+        rest_hint: null,
+        band_hint: null,
       };
-      d.workout_days.push(day);
+      d.day_exercises.push(de);
+      dayExForDay.push(de);
     }
 
-    const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
-
-    items.forEach((item, idx) => {
-      const key = norm(item.name);
-      if (!key) return;
-
-      let ex = exByName.get(key);
-      if (!ex) {
-        ex = {
-          id: uuid(),
-          name: item.name,
-          kind: 'reps',
-          description: item.notes || '',
-          persistent_notes: item.notes || '',
-          youtube_url: '',
-          archived: 0,
-        };
-        d.exercises.push(ex);
-        exByName.set(key, ex);
-      } else {
-        if (item.notes) ex.description = item.notes;
-        if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
-      }
-
-      let de = dayExForDay.find(x => x.exercise_id === ex.id);
-      if (!de) {
-        de = {
-          id: uuid(),
-          day_id: day.id,
-          exercise_id: ex.id,
-          position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
-          planned_sets: 1,
-          planned_reps: null,
-          planned_weight: null,
-          planned_duration_sec: null,
-          notes: '',
-          warmup: 0,
-          main: 0,
-          superset_id: null,
-          rest_hint: null,
-          band_hint: null,
-        };
-        d.day_exercises.push(de);
-        dayExForDay.push(de);
-      }
-
-      if (item.sets) {
-        const first = parseInt(String(item.sets).split('-')[0], 10);
-        if (!isNaN(first)) de.planned_sets = first;
-      }
-      if (item.reps) de.planned_reps = item.reps;
-      if (item.band) {
-        de.band_hint = item.band;
-        if (!de.planned_weight) de.planned_weight = item.band;
-      }
-      if (item.rest) de.rest_hint = item.rest;
-      if (item.notes) de.notes = item.notes;
-      de.main = item.main ? 1 : 0;
-      de.warmup = item.warmup ? 1 : 0;
-    });
+    if (item.sets) {
+      const first = parseInt(String(item.sets).split('-')[0], 10);
+      if (!isNaN(first)) de.planned_sets = first;
+    }
+    if (item.reps) de.planned_reps = item.reps;
+    if (item.band) {
+      de.band_hint = item.band;
+      if (!de.planned_weight) de.planned_weight = item.band;
+    }
+    if (item.rest) de.rest_hint = item.rest;
+    if (item.notes) de.notes = item.notes;
+    de.main = item.main ? 1 : 0;
+    de.warmup = item.warmup ? 1 : 0;
   });
 
   return d;
@@ -883,11 +834,6 @@ function BulkExerciseImportModal({ open, onClose }) {
     'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | rest=30s | notes=easy warmup | main=false | warmup=true',
     'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
     'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | rest=45s | notes=gently back and down | main=false | warmup=false',
-    '',
-    'DAY: Small Day E',
-    'GROUP: Shoulder Rehab',
-    'EXERCISE: Shoulder CARs | sets=1 | reps=5/side | rest=30s | notes=slow circles | main=false | warmup=true',
-    'EXERCISE: Sidelying ER | sets=2 | reps=12-15 | rest=45s | notes=control the lowering | main=true | warmup=false',
   ].join('\n');
 
   if (!open) return null;
@@ -905,8 +851,8 @@ function BulkExerciseImportModal({ open, onClose }) {
       showToast('Parse error: ' + e.message);
       return;
     }
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      showToast('Need at least one DAY, one GROUP, and one EXERCISE line');
+    if (!parsed.dayName || !parsed.groupName || parsed.items.length === 0) {
+      showToast('Need a DAY, a GROUP, and at least one EXERCISE line');
       return;
     }
     setBusy(true);
@@ -924,9 +870,9 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Existing days and exercises will be merged and updated, without duplicates.</p>
+        <p className="text-xs text-neutral-500">Paste text in the agreed format. Existing days and exercises will be merged and updated, without duplicates.</p>
         <textarea
-          rows={12}
+          rows={10}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
           value={text}
           onChange={e => setText(e.target.value)}
@@ -944,103 +890,41 @@ function BulkExerciseImportModal({ open, onClose }) {
     </Modal>
   );
 }
+
 function ExerciseEditor({ open, value, onClose, onSave }) {
   const [v, setV] = useState(value || {});
   useEffect(() => { setV(value || {}); }, [value]);
-
   if (!open) return null;
-
   const isTime = (v.kind || 'reps') === 'time';
-
   return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title={v.id ? 'Edit exercise' : 'New exercise'}
-      footer={
-        <>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={() => onSave(v)} disabled={!(v.name || '').trim()}>Save</Button>
-        </>
-      }
-    >
+    <Modal open={open} onClose={onClose} title={v.id ? 'Edit exercise' : 'New exercise'}
+      footer={<>
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <Button onClick={() => onSave(v)} disabled={!(v.name || '').trim()}>Save</Button>
+      </>}>
       <Label>Name</Label>
-      <Input
-        value={v.name || ''}
-        onChange={e => setV({ ...v, name: e.target.value })}
-        autoFocus
-      />
-
+      <Input value={v.name || ''} onChange={e => setV({ ...v, name: e.target.value })} autoFocus />
       <div className="h-3" />
-
       <Label>Type</Label>
-      <Select
-        value={v.kind || 'reps'}
-        onChange={e => setV({ ...v, kind: e.target.value, bilateral: false, use_band: false })}
-      >
+      <Select value={v.kind || 'reps'} onChange={e => setV({ ...v, kind: e.target.value, bilateral: false, use_band: false })}>
         <option value="reps">Reps (sets × reps × weight)</option>
         <option value="time">Time (duration)</option>
       </Select>
-
-      {isTime && (
-        <>
-          <div className="h-3" />
-          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={!!v.bilateral}
-              onChange={e => setV({ ...v, bilateral: e.target.checked })}
-              className="w-4 h-4 accent-green-600"
-            />
-            Bilateral (separate L / R timers)
-          </label>
-        </>
-      )}
-
-      {!isTime && (
-        <>
-          <div className="h-3" />
-          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={!!v.use_band}
-              onChange={e => setV({ ...v, use_band: e.target.checked })}
-              className="w-4 h-4 accent-green-600"
-            />
-            Band exercise (log band type instead of weight)
-          </label>
-        </>
-      )}
-
+      {isTime && <><div className="h-3" /><label className="flex items-center gap-2 text-sm cursor-pointer select-none"><input type="checkbox" checked={!!v.bilateral} onChange={e => setV({ ...v, bilateral: e.target.checked })} className="w-4 h-4 accent-green-600" />Bilateral (separate L / R timers)</label></>}
+      {!isTime && <><div className="h-3" /><label className="flex items-center gap-2 text-sm cursor-pointer select-none"><input type="checkbox" checked={!!v.use_band} onChange={e => setV({ ...v, use_band: e.target.checked })} className="w-4 h-4 accent-green-600" />Band exercise (log band type instead of weight)</label></>}
       <div className="h-3" />
-
       <Label>Description (optional)</Label>
-      <Textarea
-        rows="2"
-        value={v.description || ''}
-        onChange={e => setV({ ...v, description: e.target.value })}
-      />
-
+      <Textarea rows="2" value={v.description || ''} onChange={e => setV({ ...v, description: e.target.value })} />
       <div className="h-3" />
-
       <Label>Persistent notes (shown in every session)</Label>
-      <Textarea
-        rows="2"
-        value={v.persistent_notes || ''}
-        onChange={e => setV({ ...v, persistent_notes: e.target.value })}
-      />
-
+      <Textarea rows="2" value={v.persistent_notes || ''} onChange={e => setV({ ...v, persistent_notes: e.target.value })} />
       <div className="h-3" />
-
       <Label>YouTube URL (optional)</Label>
-      <Input
-        value={v.youtube_url || ''}
-        onChange={e => setV({ ...v, youtube_url: e.target.value })}
-        placeholder="https://…"
-      />
+      <Input value={v.youtube_url || ''} onChange={e => setV({ ...v, youtube_url: e.target.value })} placeholder="https://…" />
     </Modal>
   );
 }
+
 /* ========================================================================== */
 /* DAY EDITOR — list + reorder + supersets + add exercise                       */
 /* ========================================================================== */
@@ -2223,25 +2107,19 @@ function CalendarPage() {
 /* SETTINGS — Import / Export / Wipe                                          */
 /* ========================================================================== */
 
-const SYNCURL = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
-const SHEETURL = 'https://docs.google.com/spreadsheets/d/15XSn9GyAVI2Xi6ujuWtUXvcSpUi4_xOfQElDw0QQG7U/edit?gid=0#gid=0';
-const PENDINGSYNCKEY = 'liftlog.syncpending';
-const SYNCDEBUGKEY = 'liftlog.syncdebug';
+const SYNC_URL         = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
+const PENDING_SYNC_KEY = 'liftlog.sync_pending';
+const SYNC_DEBUG_KEY   = 'liftlog.sync_debug';
 
 // ── backgroundSync ────────────────────────────────────────────────────────────
 // Standalone async fn — no React state deps.
 // POST body: URLSearchParams (payload=JSON) — survives GAS 302 redirect, no preflight.
-// On failure: sets PENDINGSYNCKEY for retry. Never throws.
+// On failure: sets PENDING_SYNC_KEY for retry. Never throws.
 async function backgroundSync(db, opts) {
   opts = opts || {};
   const action    = opts.action    || 'auto';
   const onSuccess = opts.onSuccess || function(){};
   const onFail    = opts.onFail    || function(){};
-  const device    = opts.device    || 'phone'; // 'phone' or 'computer'
-
-  function norm(v) {
-    return String(v == null ? '' : v).trim().toLowerCase();
-  }
 
   const finishedSessions = (db.sessions || []).filter(function(s){ return s.is_finished; });
   const sortedSessions   = finishedSessions.slice().sort(function(a,b){ return (b.finished_at||0)-(a.finished_at||0); });
@@ -2257,49 +2135,47 @@ async function backgroundSync(db, opts) {
   var historyRows = [];
   var notesRows = [];
 
-  if (device !== 'computer') {
-    sortedSessions.forEach(function(s) {
-      var sessionTimestamp = s.finished_at ? new Date(s.finished_at * 1000).toISOString() : '';
-      (db.session_exercises || []).filter(function(se){ return se.session_id === s.id; }).forEach(function(se) {
-        var ex = exercisesById[se.exercise_id] || null;
-        var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
-        var completedSets = sets.filter(function(ss){ return !!ss.completed; });
-        if (!completedSets.length) {
-          historyRows.push({
-            timestamp: sessionTimestamp,
-            exercise: ex ? ex.name : '?',
-            reps: se.planned_reps != null ? se.planned_reps : '',
-            sets: sets.length || '',
-          });
-        } else {
-          historyRows.push({
-            timestamp: sessionTimestamp,
-            exercise: ex ? ex.name : '?',
-            reps: completedSets.map(function(ss){
-              return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
-            }).filter(function(v){ return v !== ''; }).join(', '),
-            sets: completedSets.length,
-          });
-        }
-        if (se.session_note && se.session_note.trim()) {
-          notesRows.push({
-            timestamp: sessionTimestamp,
-            exercise: ex ? ex.name : '?',
-            note: se.session_note.trim(),
-          });
-        }
-      });
+  sortedSessions.forEach(function(s) {
+    var sessionTimestamp = s.finished_at ? new Date(s.finished_at * 1000).toISOString() : '';
+    (db.session_exercises || []).filter(function(se){ return se.session_id === s.id; }).forEach(function(se) {
+      var ex = exercisesById[se.exercise_id] || null;
+      var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
+      var completedSets = sets.filter(function(ss){ return !!ss.completed; });
+      if (!completedSets.length) {
+        historyRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          reps: se.planned_reps != null ? se.planned_reps : '',
+          sets: sets.length || '',
+        });
+      } else {
+        historyRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          reps: completedSets.map(function(ss){
+            return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
+          }).filter(function(v){ return v !== ''; }).join(', '),
+          sets: completedSets.length,
+        });
+      }
+      if (se.session_note && se.session_note.trim()) {
+        notesRows.push({
+          timestamp: sessionTimestamp,
+          exercise: ex ? ex.name : '?',
+          note: se.session_note.trim(),
+        });
+      }
     });
+  });
 
-    (db.notes_library || []).forEach(function(n) {
-      var ex = n.exercise_id ? exercisesById[n.exercise_id] : null;
-      notesRows.push({
-        timestamp: '',
-        exercise: ex ? ex.name : '',
-        note: n.text || '',
-      });
+  (db.notes_library || []).forEach(function(n) {
+    var ex = n.exercise_id ? exercisesById[n.exercise_id] : null;
+    notesRows.push({
+      timestamp: '',
+      exercise: ex ? ex.name : '',
+      note: n.text || '',
     });
-  }
+  });
 
   var exerciseGroupMap = {};
   (db.day_exercises || []).forEach(function(de) {
@@ -2307,7 +2183,7 @@ async function backgroundSync(db, opts) {
     var day = daysById[de.day_id];
     var group = day && day.group_id ? groupsById[day.group_id] : null;
     if (!ex) return;
-    var key = norm(ex.name);
+    var key = (ex.name || '').trim().toLowerCase();
     if (!key) return;
     if (!exerciseGroupMap[key]) {
       exerciseGroupMap[key] = {
@@ -2325,7 +2201,7 @@ async function backgroundSync(db, opts) {
     }
   });
   (db.exercises || []).forEach(function(ex) {
-    var key = norm(ex.name);
+    var key = (ex.name || '').trim().toLowerCase();
     if (!key) return;
     if (!exerciseGroupMap[key]) {
       exerciseGroupMap[key] = {
@@ -2347,7 +2223,7 @@ async function backgroundSync(db, opts) {
       };
     });
 
-  var workoutDaysRowsRaw = (db.workout_days || [])
+  var workoutDaysRows = (db.workout_days || [])
     .slice()
     .sort(function(a,b){ return (a.sort_order || 0) - (b.sort_order || 0); })
     .map(function(d){
@@ -2359,17 +2235,7 @@ async function backgroundSync(db, opts) {
       };
     });
 
-  var seenWorkoutDayKeys = {};
-  var workoutDaysRows = [];
-  workoutDaysRowsRaw.forEach(function(row) {
-    var key = norm(row.group_name) + '||' + norm(row.day_name);
-    if (!norm(row.day_name)) return;
-    if (seenWorkoutDayKeys[key]) return;
-    seenWorkoutDayKeys[key] = true;
-    workoutDaysRows.push(row);
-  });
-
-  var dayExercisesRowsRaw = (db.day_exercises || [])
+  var dayExercisesRows = (db.day_exercises || [])
     .slice()
     .sort(function(a,b){
       if ((a.day_id || '') === (b.day_id || '')) return (a.position || 0) - (b.position || 0);
@@ -2399,76 +2265,50 @@ async function backgroundSync(db, opts) {
       return row.day_name && row.exercise_name;
     });
 
-  var seenDayExerciseKeys = {};
-  var dayExercisesRows = [];
-  dayExercisesRowsRaw.forEach(function(row) {
-    var key = [
-      norm(row.group_name),
-      norm(row.day_name),
-      String(row.position == null ? '' : row.position),
-      norm(row.exercise_name)
-    ].join('||');
-    if (seenDayExerciseKeys[key]) return;
-    seenDayExerciseKeys[key] = true;
-    dayExercisesRows.push(row);
-  });
-
-  var tables = {
-    Exercises: exercisesRows,
-    Groups: groupsRows,
-    WorkoutDays: workoutDaysRows,
-    DayExercises: dayExercisesRows,
-  };
-
-  var columns = {
-    Exercises: ['exercise_name', 'description', 'group'],
-    Groups: ['group_name', 'sort_order'],
-    WorkoutDays: ['day_name', 'group_name', 'sort_order'],
-    DayExercises: [
-      'day_name',
-      'group_name',
-      'position',
-      'exercise_name',
-      'planned_sets',
-      'planned_reps',
-      'planned_weight',
-      'planned_duration_sec',
-      'notes',
-      'warmup',
-      'main',
-      'rest_hint',
-      'band_hint'
-    ],
-  };
-
-  var tabList = ['Exercises', 'Groups', 'WorkoutDays', 'DayExercises'];
-
-  if (device !== 'computer') {
-    tables.History = historyRows;
-    tables.Notes = notesRows;
-    columns.History = ['timestamp', 'exercise', 'reps', 'sets'];
-    columns.Notes = ['timestamp', 'exercise', 'note'];
-    tabList = ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'];
-  }
-
   var syncId   = (typeof uuid==='function') ? uuid() : Math.random().toString(36).slice(2);
   var syncedAt = new Date().toISOString();
   var payload = {
     data: {
-      tables: tables,
+      tables: {
+        History: historyRows,
+        Exercises: exercisesRows,
+        Notes: notesRows,
+        Groups: groupsRows,
+        WorkoutDays: workoutDaysRows,
+        DayExercises: dayExercisesRows,
+      },
       meta: {
         sync_id: syncId,
         synced_at: syncedAt,
-        version: 'liftlog.sheettabs.v5',
-        device: device,
-        tabs: tabList,
-        columns: columns,
+        version: 'liftlog.sheettabs.v4',
+        tabs: ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'],
+        columns: {
+          History: ['timestamp', 'exercise', 'reps', 'sets'],
+          Exercises: ['exercise_name', 'description', 'group'],
+          Notes: ['timestamp', 'exercise', 'note'],
+          Groups: ['group_name', 'sort_order'],
+          WorkoutDays: ['day_name', 'group_name', 'sort_order'],
+          DayExercises: [
+            'day_name',
+            'group_name',
+            'position',
+            'exercise_name',
+            'planned_sets',
+            'planned_reps',
+            'planned_weight',
+            'planned_duration_sec',
+            'notes',
+            'warmup',
+            'main',
+            'rest_hint',
+            'band_hint'
+          ],
+        },
       },
       syncLog: {
         sync_id: syncId,
         synced_at: syncedAt,
         action: action,
-        device: device,
         history_rows: historyRows.length,
         exercises_rows: exercisesRows.length,
         notes_rows: notesRows.length,
@@ -2479,19 +2319,15 @@ async function backgroundSync(db, opts) {
     }
   };
 
-  var totalRaw = 0;
-  Object.keys(tables).forEach(function(k) {
-    totalRaw += (tables[k] || []).length;
-  });
-
-  var debugBase = { action:action, device:device, time:new Date().toLocaleString(), records: totalRaw+' rows',
+  var totalRaw = historyRows.length + exercisesRows.length + notesRows.length + groupsRows.length + workoutDaysRows.length + dayExercisesRows.length;
+  var debugBase = { action:action, time:new Date().toLocaleString(), records: totalRaw+' rows',
                     status:null, httpStatus:null, error:null };
 
   var controller = new AbortController();
   var timer = setTimeout(function(){ controller.abort(); }, 30000);
 
   try {
-    var res = await fetch(SYNCURL, {
+    var res = await fetch(SYNC_URL, {
       method: 'POST',
       signal: controller.signal,
       body: new URLSearchParams({ payload: JSON.stringify(payload) }),
@@ -2504,20 +2340,20 @@ async function backgroundSync(db, opts) {
     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (text||'').slice(0,80));
     if (json && json.error) throw new Error('App error: ' + json.error);
 
-    localStorage.removeItem(PENDINGSYNCKEY);
+    localStorage.removeItem(PENDING_SYNC_KEY);
     var ts = new Date().toLocaleString();
     localStorage.setItem('liftlog.last_sync', ts);
     var dbg = Object.assign({}, debugBase, { status:'ok', httpStatus:res.status });
-    localStorage.setItem(SYNCDEBUGKEY, JSON.stringify(dbg));
-    console.log('[LiftLog Sync] OK —', totalRaw, 'rows, action:', action, 'device:', device);
+    localStorage.setItem(SYNC_DEBUG_KEY, JSON.stringify(dbg));
+    console.log('[LiftLog Sync] OK —', totalRaw, 'rows, action:', action);
     onSuccess(ts);
     return { ok:true };
   } catch(err) {
     clearTimeout(timer);
     var msg = err && err.name==='AbortError' ? 'Timed out after 30s' : (err && err.message ? err.message : String(err));
-    localStorage.setItem(PENDINGSYNCKEY, '1');
+    localStorage.setItem(PENDING_SYNC_KEY, '1');
     var dbg2 = Object.assign({}, debugBase, { status: err && err.name==='AbortError' ? 'timeout':'error', error:msg });
-    localStorage.setItem(SYNCDEBUGKEY, JSON.stringify(dbg2));
+    localStorage.setItem(SYNC_DEBUG_KEY, JSON.stringify(dbg2));
     console.warn('[LiftLog Sync] Failed (' + action + '):', msg);
     onFail(msg);
     return { ok:false, error:msg };
@@ -2529,15 +2365,11 @@ async function pullFromSheets(db, opts) {
   const onSuccess = opts.onSuccess || function(){};
   const onFail    = opts.onFail    || function(){};
 
-  function norm(v) {
-    return String(v == null ? '' : v).trim().toLowerCase();
-  }
-
   var controller = new AbortController();
   var timer = setTimeout(function(){ controller.abort(); }, 30000);
 
   try {
-    var url = SYNCURL + (SYNCURL.indexOf('?') >= 0 ? '&' : '?') + 'action=pull';
+    var url = SYNC_URL + (SYNC_URL.indexOf('?') >= 0 ? '&' : '?') + 'action=pull';
     var res = await fetch(url, {
       method: 'GET',
       signal: controller.signal,
@@ -2552,10 +2384,10 @@ async function pullFromSheets(db, opts) {
     if (!json || json.error) throw new Error(json && json.error ? json.error : 'Invalid pull response');
 
     var tables = (((json || {}).data || {}).tables) || {};
-    var exercisesRows    = tables.Exercises || [];
-    var notesRows        = tables.Notes || [];
-    var groupsRows       = tables.Groups || [];
-    var workoutDaysRows  = tables.WorkoutDays || [];
+    var exercisesRows   = tables.Exercises || [];
+    var notesRows       = tables.Notes || [];
+    var groupsRows      = tables.Groups || [];
+    var workoutDaysRows = tables.WorkoutDays || [];
     var dayExercisesRows = tables.DayExercises || [];
 
     var nextDb = structuredClone(db);
@@ -2568,14 +2400,14 @@ async function pullFromSheets(db, opts) {
 
     var exByName = {};
     nextDb.exercises.forEach(function(ex) {
-      var key = norm(ex.name);
+      var key = String(ex.name || '').trim().toLowerCase();
       if (key) exByName[key] = ex;
     });
 
     exercisesRows.forEach(function(row) {
       var name = String((row && row.exercise_name) || '').trim();
       if (!name) return;
-      var key = norm(name);
+      var key = name.toLowerCase();
       var ex = exByName[key];
       if (!ex) {
         ex = {
@@ -2596,27 +2428,22 @@ async function pullFromSheets(db, opts) {
 
     var existingGroupByName = {};
     nextDb.groups.forEach(function(g) {
-      var key = norm(g.name);
+      var key = String(g.name || '').trim().toLowerCase();
       if (key) existingGroupByName[key] = g;
     });
 
     var newGroups = [];
     var pulledGroupByName = {};
-    var seenGroupKeys = {};
     groupsRows.forEach(function(row, idx) {
       var name = String((row && row.group_name) || '').trim();
       if (!name) return;
-      var key = norm(name);
-      if (seenGroupKeys[key]) return;
-      seenGroupKeys[key] = true;
-
+      var key = name.toLowerCase();
       var g = existingGroupByName[key] || {
         id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
         created_at: Math.floor(Date.now() / 1000),
       };
       g.name = name;
       g.sort_order = row.sort_order !== '' && row.sort_order != null ? Number(row.sort_order) : (idx + 1);
-
       newGroups.push(g);
       pulledGroupByName[key] = g;
     });
@@ -2626,23 +2453,19 @@ async function pullFromSheets(db, opts) {
     var existingDayByKey = {};
     oldDays.forEach(function(d) {
       var group = d.group_id ? nextDb.groups.find(function(g){ return g.id === d.group_id; }) : null;
-      var key = norm(d.name) + '||' + norm(group && group.name);
-      if (key) existingDayByKey[key] = d;
+      var key = String(d.name || '').trim().toLowerCase() + '||' + String(group && group.name || '').trim().toLowerCase();
+      existingDayByKey[key] = d;
     });
 
     var newWorkoutDays = [];
     var pulledDayByKey = {};
-    var seenWorkoutDayKeys = {};
     workoutDaysRows.forEach(function(row, idx) {
       var dayName = String((row && row.day_name) || '').trim();
       var groupName = String((row && row.group_name) || '').trim();
       if (!dayName) return;
 
-      var group = groupName ? pulledGroupByName[norm(groupName)] : null;
-      var dayKey = norm(dayName) + '||' + norm(groupName);
-      if (seenWorkoutDayKeys[dayKey]) return;
-      seenWorkoutDayKeys[dayKey] = true;
-
+      var group = groupName ? pulledGroupByName[groupName.toLowerCase()] : null;
+      var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
       var day = existingDayByKey[dayKey] || {
         id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
         created_at: Math.floor(Date.now() / 1000),
@@ -2658,12 +2481,11 @@ async function pullFromSheets(db, opts) {
     nextDb.workout_days = newWorkoutDays;
 
     var newDayExercises = [];
-    var seenDayExerciseKeys = {};
     dayExercisesRows
       .slice()
       .sort(function(a,b){
-        var ak = norm((a && a.day_name) || '') + '||' + norm((a && a.group_name) || '');
-        var bk = norm((b && b.day_name) || '') + '||' + norm((b && b.group_name) || '');
+        var ak = String((a && a.day_name) || '') + '||' + String((a && a.group_name) || '');
+        var bk = String((b && b.day_name) || '') + '||' + String((b && b.group_name) || '');
         if (ak === bk) return Number(a.position || 0) - Number(b.position || 0);
         return ak.localeCompare(bk);
       })
@@ -2673,18 +2495,10 @@ async function pullFromSheets(db, opts) {
         var exerciseName = String((row && row.exercise_name) || '').trim();
         if (!dayName || !exerciseName) return;
 
-        var dayKey = norm(dayName) + '||' + norm(groupName);
+        var dayKey = dayName.toLowerCase() + '||' + groupName.toLowerCase();
         var day = pulledDayByKey[dayKey];
-        var ex = exByName[norm(exerciseName)];
+        var ex = exByName[exerciseName.toLowerCase()];
         if (!day || !ex) return;
-
-        var deKey = [
-          dayKey,
-          String(row.position !== '' && row.position != null ? Number(row.position) : ''),
-          norm(exerciseName)
-        ].join('||');
-        if (seenDayExerciseKeys[deKey]) return;
-        seenDayExerciseKeys[deKey] = true;
 
         newDayExercises.push({
           id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
@@ -2708,7 +2522,7 @@ async function pullFromSheets(db, opts) {
     nextDb.notes_library.forEach(function(n) {
       var key = [
         String(n.exercise_id || ''),
-        norm(n.text || '')
+        String(n.text || '').trim().toLowerCase()
       ].join('||');
       noteSeen[key] = true;
     });
@@ -2718,10 +2532,10 @@ async function pullFromSheets(db, opts) {
       var noteText = String((row && row.note) || '').trim();
       if (!exName || !noteText) return;
 
-      var ex = exByName[norm(exName)];
+      var ex = exByName[exName.toLowerCase()];
       if (!ex) return;
 
-      var noteKey = [String(ex.id), norm(noteText)].join('||');
+      var noteKey = [String(ex.id), noteText.toLowerCase()].join('||');
       if (noteSeen[noteKey]) return;
 
       nextDb.notes_library.push({
@@ -2758,25 +2572,22 @@ async function pullFromSheets(db, opts) {
 
 function SettingsPage() {
   const { db, setDb, showToast } = useApp();
-  const [syncing, setSyncing] = useState(false);
-  const [pulling, setPulling] = useState(false);
-  const [syncStatus, setSyncStatus] = useState('idle');
-  const [lastSync, setLastSync] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastsync') || null; }
-    catch (e) { return null; }
+  const [syncing,     setSyncing]     = useState(false);
+  const [pulling,     setPulling]     = useState(false);
+  const [syncStatus,  setSyncStatus]  = useState('idle');
+  const [lastSync,    setLastSync]    = useState(function() {
+    try { return localStorage.getItem('liftlog.last_sync') || null; } catch(e) { return null; }
   });
-  const [lastPull, setLastPull] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastpull') || null; }
-    catch (e) { return null; }
+  const [lastPull,    setLastPull]    = useState(function() {
+    try { return localStorage.getItem('liftlog.last_pull') || null; } catch(e) { return null; }
   });
-  const [pendingSync, setPendingSync] = useState(() => {
-    try { return localStorage.getItem(PENDINGSYNCKEY) === '1'; }
-    catch (e) { return false; }
+  const [pendingSync, setPendingSync] = useState(function() {
+    try { return localStorage.getItem(PENDING_SYNC_KEY) === '1'; } catch(e) { return false; }
   });
 
   const doManualSync = async function(action, successMsg) {
-    action = action || 'manual-push';
-    successMsg = successMsg || 'Synced';
+    action     = action     || 'manual-push';
+    successMsg = successMsg || 'Synced ✓';
     setSyncing(true);
     setSyncStatus('syncing');
 
@@ -2785,12 +2596,12 @@ function SettingsPage() {
       onSuccess: function(ts) {
         setLastSync(ts);
         setSyncStatus('ok');
-        try { setPendingSync(localStorage.getItem(PENDINGSYNCKEY) === '1'); } catch (e) {}
+        try { setPendingSync(localStorage.getItem(PENDING_SYNC_KEY) === '1'); } catch(e) {}
         showToast(successMsg);
       },
       onFail: function(msg) {
         setSyncStatus('error');
-        try { setPendingSync(localStorage.getItem(PENDINGSYNCKEY) === '1'); } catch (e) {}
+        try { setPendingSync(localStorage.getItem(PENDING_SYNC_KEY) === '1'); } catch(e) {}
         showToast('Sync failed: ' + msg);
       },
     });
@@ -2799,12 +2610,15 @@ function SettingsPage() {
   };
 
   const pushToSheets = function() {
-    doManualSync('manual-push', 'Saved plans/history to Google Sheets');
+    doManualSync('manual-push', 'Saved plans/history to Google Sheets ✓');
   };
 
   const pullFromSheetsNow = async function() {
     var ok = window.confirm(
-      'Pull latest spreadsheet-backed plans into this device? This will replace local groups, workout days, and planned day exercises with the spreadsheet version. Exercises will be merged/updated by name. Workout history and calendar data on this phone will stay untouched.'
+      'Pull latest spreadsheet-backed plans into this device?\n\n' +
+      'This will replace local groups, workout days, and planned day exercises with the spreadsheet version.\n' +
+      'Exercises will be merged/updated by name.\n' +
+      'Workout history and calendar data on this phone will stay untouched.'
     );
     if (!ok) return;
 
@@ -2816,7 +2630,7 @@ function SettingsPage() {
         setDb(nextDb);
         setLastPull(info.timestamp);
         setSyncStatus('ok');
-        showToast('Pulled plans from Google Sheets');
+        showToast('Pulled plans from Google Sheets ✓');
       },
       onFail: function(msg) {
         setSyncStatus('error');
@@ -2827,23 +2641,8 @@ function SettingsPage() {
     setPulling(false);
   };
 
-  const openSheet = () => {
-    window.open(SHEETURL, '_blank', 'noopener,noreferrer');
-  };
-
-  const statusColor = {
-    idle: 'text-neutral-400',
-    syncing: 'text-yellow-500',
-    ok: 'text-green-600',
-    error: 'text-red-500'
-  };
-
-  const statusLabel = {
-    idle: '',
-    syncing: 'Working…',
-    ok: 'Done',
-    error: 'Sync error'
-  };
+  const statusColor = { idle: 'text-neutral-400', syncing: 'text-yellow-500', ok: 'text-green-600', error: 'text-red-500' };
+  const statusLabel = { idle: '', syncing: 'Working…', ok: 'Done', error: 'Sync error' };
 
   return (
     <PageShell title="Settings">
@@ -2864,20 +2663,28 @@ function SettingsPage() {
           <p className="text-xs text-neutral-400 mb-1">
             Phone workout history stays local. Push/pull is mainly for exercises and workout plans.
           </p>
+
           {lastSync && <p className="text-xs text-neutral-400 mb-1">Last push: {lastSync}</p>}
           {lastPull && <p className="text-xs text-neutral-400 mb-2">Last pull: {lastPull}</p>}
 
           <Button className="w-full text-xs mb-2" onClick={pushToSheets} disabled={syncing || pulling}>
-            {syncing ? 'Syncing...' : 'Push now'}
+            {syncing ? '…' : '⬆'} Push now
           </Button>
 
-          <Button variant="outline" className="w-full text-xs mb-2" onClick={pullFromSheetsNow} disabled={syncing || pulling}>
-            {pulling ? 'Pulling...' : 'Pull now'}
+          <Button
+            variant="outline"
+            className="w-full text-xs mb-3"
+            onClick={pullFromSheetsNow}
+            disabled={syncing || pulling}
+          >
+            {pulling ? '…' : '⬇'} Pull now
           </Button>
 
-          <Button variant="outline" className="w-full text-xs mb-3" onClick={openSheet}>
-            Open spreadsheet
-          </Button>
+          <div className="text-xs text-neutral-500 space-y-1">
+            <p>Push sends history, exercises, notes, groups, workout days, and planned day exercises.</p>
+            <p>Pull restores groups, workout days, planned day exercises, exercises, and notes.</p>
+            <p>Pull does not replace sessions, session logs, calendar history, or completed workout data on this phone.</p>
+          </div>
         </Card>
       </div>
     </PageShell>
