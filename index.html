@@ -88,7 +88,15 @@ function loadDb() {
 }
 
 function saveDb(db) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  } catch (e) {
+    if (e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED')) {
+      alert('⚠️ Storage is full — your last change could not be saved.\nPlease go to Settings and export a backup to free up space.');
+    } else {
+      console.error('[LiftLog] saveDb failed:', e);
+    }
+  }
 }
 
 const uuid = () => {
@@ -1104,9 +1112,12 @@ function DayEditorPage({ id }) {
       // Move all selected to be contiguous: keep original order, append non-selected after
       const selected = dayDesSorted.filter(de => selSet.has(de.id));
       const nonSel = dayDesSorted.filter(de => !selSet.has(de.id));
-      // Insert selected at the position of the first-selected
+      // Insert selected at the position of the first-selected item.
+      // firstSelIdx is the index in the full list; we need the equivalent index
+      // in nonSel (i.e. how many non-selected items come before the first selected one).
       const firstSelIdx = dayDesSorted.findIndex(de => selSet.has(de.id));
-      const reordered = [...nonSel.slice(0, firstSelIdx), ...selected, ...nonSel.slice(firstSelIdx)];
+      const insertAt = dayDesSorted.slice(0, firstSelIdx).filter(de => !selSet.has(de.id)).length;
+      const reordered = [...nonSel.slice(0, insertAt), ...selected, ...nonSel.slice(insertAt)];
       reordered.forEach((de, i) => {
         const t = d.day_exercises.find(x => x.id === de.id);
         if (t) {
@@ -2006,6 +2017,11 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   const [rDone, setRDone] = useState(false);
   const lRef = useRef(null); const rRef = useRef(null);
   const pRef = useRef(plannedSec);
+  // Refs that mirror lDone/rDone so setInterval callbacks always read fresh values
+  const lDoneRef = useRef(false);
+  const rDoneRef = useRef(false);
+  useEffect(() => { lDoneRef.current = lDone; }, [lDone]);
+  useEffect(() => { rDoneRef.current = rDone; }, [rDone]);
   useEffect(() => { pRef.current = plannedSec; }, [plannedSec]);
   useEffect(() => { if (!lRun && !lDone) setLRem(plannedSec); }, [plannedSec, lRun, lDone]);
   useEffect(() => { if (!rRun && !rDone) setRRem(plannedSec); }, [plannedSec, rRun, rDone]);
@@ -2021,11 +2037,13 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
 
   const startSide = (side) => {
     const isL = side === 'L';
-    const otherDone = isL ? rDone : lDone;
+    // Use ref (not state) to read otherDone inside the interval — avoids stale closure
+    const otherDoneRef = isL ? rDoneRef : lDoneRef;
     const ref = isL ? lRef : rRef;
     const setRun = isL ? setLRun : setRRun;
     const setRem = isL ? setLRem : setRRem;
     const setDone = isL ? setLDone : setRDone;
+    const doneRef = isL ? lDoneRef : rDoneRef;
     const p = pRef.current;
     setRun(true);
     const t0 = Date.now();
@@ -2033,9 +2051,10 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
       const left = p - Math.floor((Date.now() - t0) / 1000);
       if (left <= 0) {
         clearInterval(ref.current); ref.current = null;
+        doneRef.current = true;
         setRem(0); setRun(false); setDone(true);
         try { playBeep(); } catch (_) {}
-        if (otherDone) markBothDone();
+        if (otherDoneRef.current) markBothDone();
       } else { setRem(left); }
     }, 200);
   };
@@ -2103,21 +2122,23 @@ function HistoryPage() {
   return (
     <PageShell title="History">
       <div className="p-4">
-        {items.length === 0 && <p className="text-sm text-neutral-500 text-center py-8">No finished sessions yet.</p>}
-        <Card className="divide-y divide-neutral-100">
-          {items.map(({ s, day, count, completedSets, totalSets }) => (
-            <button key={s.id} onClick={() => navigate(`/history/${s.id}`)} className="w-full text-left p-3 flex items-center gap-2">
-              <div className="flex-1 min-w-0">
-                <div className="font-medium truncate">{day?.name || '(deleted day)'}</div>
-                <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</div>
-              </div>
-              <div className="text-xs text-right text-neutral-500">
-                <div>{count} ex</div>
-                <div>{completedSets}/{totalSets} sets</div>
-              </div>
-            </button>
-          ))}
-        </Card>
+        {items.length === 0
+          ? <p className="text-sm text-neutral-500 text-center py-8">No finished sessions yet.</p>
+          : <Card className="divide-y divide-neutral-100">
+              {items.map(({ s, day, count, completedSets, totalSets }) => (
+                <button key={s.id} onClick={() => navigate(`/history/${s.id}`)} className="w-full text-left p-3 flex items-center gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium truncate">{day?.name || '(deleted day)'}</div>
+                    <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</div>
+                  </div>
+                  <div className="text-xs text-right text-neutral-500">
+                    <div>{count} ex</div>
+                    <div>{completedSets}/{totalSets} sets</div>
+                  </div>
+                </button>
+              ))}
+            </Card>
+        }
       </div>
     </PageShell>
   );
@@ -2173,6 +2194,7 @@ function CalendarPage() {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth()); // 0-11
+  const [multiDaySessions, setMultiDaySessions] = useState(null); // list of sessions for multi-session day
 
   const sessionsByDate = useMemo(() => {
     const m = new Map();
@@ -2213,7 +2235,10 @@ function CalendarPage() {
             const isToday = year === today.getFullYear() && month === today.getMonth() && c === today.getDate();
             return (
               <button key={i} className={`aspect-square rounded-lg border text-xs flex flex-col items-center justify-center p-0.5 ${isToday ? 'border-brand' : 'border-neutral-200'} ${list.length ? 'bg-brand/10' : 'bg-white'}`}
-                onClick={() => list.length === 1 ? navigate(`/history/${list[0].id}`) : null}>
+                onClick={() => {
+                  if (list.length === 1) { navigate(`/history/${list[0].id}`); }
+                  else if (list.length > 1) { setMultiDaySessions(list); }
+                }}>
                 <div className="font-medium">{c}</div>
                 {list.length > 0 && <div className="text-[10px] text-brand">{list.length}</div>}
               </button>
@@ -2222,6 +2247,24 @@ function CalendarPage() {
         </div>
         <p className="text-xs text-neutral-500 mt-3">Tap a day to view its session.</p>
       </div>
+      {/* Multi-session picker modal */}
+      {multiDaySessions && (
+        <Modal open={true} onClose={() => setMultiDaySessions(null)} title="Sessions that day">
+          <div className="space-y-2">
+            {multiDaySessions.map(s => {
+              const day = db.workout_days.find(d => d.id === s.day_id);
+              return (
+                <button key={s.id}
+                  className="w-full text-left p-3 rounded-lg border border-neutral-200 hover:bg-neutral-50 active:bg-neutral-100"
+                  onClick={() => { setMultiDaySessions(null); navigate(`/history/${s.id}`); }}>
+                  <div className="font-medium text-sm">{day?.name || '(deleted day)'}</div>
+                  <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</div>
+                </button>
+              );
+            })}
+          </div>
+        </Modal>
+      )}
     </PageShell>
   );
 }
@@ -2765,11 +2808,11 @@ function SettingsPage() {
   const [pulling, setPulling] = useState(false);
   const [syncStatus, setSyncStatus] = useState('idle');
   const [lastSync, setLastSync] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastsync') || null; }
+    try { return localStorage.getItem('liftlog.last_sync') || null; }
     catch (e) { return null; }
   });
   const [lastPull, setLastPull] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastpull') || null; }
+    try { return localStorage.getItem('liftlog.last_pull') || null; }
     catch (e) { return null; }
   });
   const [pendingSync, setPendingSync] = useState(() => {
