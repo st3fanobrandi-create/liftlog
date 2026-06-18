@@ -1443,13 +1443,24 @@ function getExerciseDefaultsMap(db) {
     for (const se of ses) {
       if (map.has(se.exercise_id)) continue;
       const sets = (db.session_sets || [])
-        .filter(ss => ss.session_exercise_id === se.id && ss.completed)
+        .filter(ss => ss.session_exercise_id === se.id)
         .sort((a, b) => a.set_number - b.set_number);
-      const lastSet = sets[sets.length - 1];
+      const completedSets = sets.filter(ss => ss.completed);
+      const allSets = completedSets.length > 0 ? completedSets : sets;
+      const lastSet = allSets[allSets.length - 1];
       map.set(se.exercise_id, {
+        // Per-set values: array of {reps, weight} for each set position
+        sets: allSets.map(ss => ({
+          reps:   ss.actual_reps   ?? null,
+          weight: ss.actual_weight ?? null,
+          duration_sec: ss.actual_duration_sec ?? null,
+        })),
+        // Fallbacks for single values (used for planned fields)
         reps:         (lastSet?.actual_reps   ?? se.planned_reps)         || null,
         weight:       (lastSet?.actual_weight ?? se.planned_weight)       || null,
         duration_sec: (lastSet?.actual_duration_sec ?? se.planned_duration_sec) || null,
+        // Last note written for this exercise
+        note: se.session_note || null,
       });
     }
   }
@@ -1492,18 +1503,23 @@ function startSession(db, mutate, dayId, navigate, showToast) {
         planned_duration_sec: prefillDur,
         superset_label: de.superset_id ? (ssLabelById.get(de.superset_id) || null) : null,
         superset_key: de.superset_id || null,
-        session_note: null,
+        session_note: defs.note || null,
       });
       const n = de.planned_sets || 1;
+      const prevSets = defs.sets || [];
       for (let i = 1; i <= n; i++) {
+        // Prefill from the matching set position of the last session (i-1 index).
+        // If the previous session had fewer sets, fall back to the last available set.
+        const prevIdx = Math.min(i - 1, prevSets.length - 1);
+        const prev = prevSets.length > 0 ? prevSets[prevIdx] : null;
         d.session_sets.push({
           id: uuid(),
           session_exercise_id: seId,
           set_number: i,
-          actual_reps: null,
-          actual_weight: null,
+          actual_reps: prev?.reps ?? null,
+          actual_weight: prev?.weight ?? null,
           completed: 0,
-          actual_duration_sec: null,
+          actual_duration_sec: prev?.duration_sec ?? null,
         });
       }
     });
@@ -1631,8 +1647,13 @@ function SessionPage({ id }) {
         superset_label: null, superset_key: null, session_note: null,
       });
       const n = Number(numSets) || 1;
+      const addDefMap = getExerciseDefaultsMap(d);
+      const addDefs = addDefMap.get(exObj.id) || {};
+      const addPrevSets = addDefs.sets || [];
       for (let i = 1; i <= n; i++) {
-        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
+        const prevIdx = Math.min(i - 1, addPrevSets.length - 1);
+        const addPrev = addPrevSets.length > 0 ? addPrevSets[prevIdx] : null;
+        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: addPrev?.reps ?? null, actual_weight: addPrev?.weight ?? null, completed: 0, actual_duration_sec: addPrev?.duration_sec ?? null });
       }
       return d;
     });
@@ -1691,6 +1712,12 @@ function SessionExercise({ se, onReplace }) {
   const { db, mutate } = useApp();
   const ex = db.exercises.find(e => e.id === se.exercise_id);
   const sets = db.session_sets.filter(s => s.session_exercise_id === se.id).slice().sort((a, b) => a.set_number - b.set_number);
+
+  // Compute last-session values for the "last time" reference badge
+  const lastDefs = useMemo(() => {
+    const map = getExerciseDefaultsMap(db);
+    return map.get(se.exercise_id) || null;
+  }, [db, se.exercise_id]);
 
   const updateSet = (setId, patch) => {
     mutate(d => {
@@ -1847,6 +1874,21 @@ function SessionExercise({ se, onReplace }) {
         </div>
       ) : (
         <div className="space-y-1.5">
+          {lastDefs && lastDefs.sets && lastDefs.sets.length > 0 && (
+            <div className="flex items-center gap-1.5 px-1 py-1 rounded-md bg-neutral-50 border border-neutral-200">
+              <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wide shrink-0">Last</span>
+              <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+                {lastDefs.sets.map((ps, i) => (
+                  <span key={i} className="text-[11px] text-neutral-500">
+                    <span className="font-medium text-neutral-600">#{i+1}</span>
+                    {ps.reps != null && ps.reps !== '' ? ` ${ps.reps}` : ''}
+                    {ps.weight != null && ps.weight !== '' ? ` @ ${ps.weight}` : ''}
+                    {(ps.reps == null || ps.reps === '') && (ps.weight == null || ps.weight === '') ? ' —' : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
           {sets.map(s => (
             <div key={s.id} className="flex items-center gap-2">
               <div className="w-6 text-xs text-neutral-500 shrink-0">#{s.set_number}</div>
@@ -1880,7 +1922,8 @@ function SessionExercise({ se, onReplace }) {
       )}
 
       <div className="mt-2">
-        <Textarea rows="2" placeholder="Note for this session (optional)"
+        <Textarea rows="2"
+          placeholder={lastDefs?.note ? `Last: ${lastDefs.note}` : 'Note for this session (optional)'}
           value={se.session_note || ''} onChange={e => setNote(e.target.value)}
           data-testid={`textarea-note-${se.id}`} />
       </div>
