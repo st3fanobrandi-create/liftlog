@@ -61,6 +61,8 @@ const SYNCDEBUGKEY = 'liftlog.syncdebug';
 /* ========================================================================== */
 
 const STORAGE_KEY = 'liftlog.v1';
+const STARTUP_TAB_KEY = 'liftlog.startup_tab';
+const MOTIV_IMAGE_KEY = 'liftlog.motiv_image';
 
 const emptyDb = () => ({
   exercises: [],
@@ -198,14 +200,35 @@ class ErrorBoundary extends React.Component {
 /* ========================================================================== */
 
 function useHashRoute() {
-  const [hash, setHash] = useState(window.location.hash || '#/');
+  const [, forceUpdate] = useState(0);
+
   useEffect(() => {
-    const onChange = () => setHash(window.location.hash || '#/');
+    // Redirect only truly bare launches to /motivation.
+    // '#/' is a real route for the Days page and must never be rewritten.
+    const h = window.location.hash;
+    if (!h || h === '#') {
+      window.location.hash = '#/motivation';
+    }
+    const onChange = () => forceUpdate(n => n + 1);
     window.addEventListener('hashchange', onChange);
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
-  const path = hash.replace(/^#/, '') || '/';
-  return { path, navigate: (p) => { window.location.hash = '#' + p; } };
+
+  const navigate = (p) => {
+    const next = '#' + p;
+    if (window.location.hash === next) {
+      // Same hash — hashchange won't fire, force update manually
+      forceUpdate(n => n + 1);
+    } else {
+      window.location.hash = next;
+    }
+  };
+
+  const h = window.location.hash;
+  const raw = h.replace(/^#/, '');
+  // Only treat completely empty hash as motivation — '#/' is the Days route
+  const path = !raw ? '/motivation' : raw;
+  return { path, navigate };
 }
 
 /* ========================================================================== */
@@ -239,6 +262,8 @@ const I = {
   history: <Icon d={<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>} />,
   upload: <Icon d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></>} />,
   download: <Icon d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></>} />,
+  image: <Icon d={<><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></>} />,
+  star: <Icon d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />,
 };
 
 /* ========================================================================== */
@@ -346,13 +371,14 @@ function PageShell({ title, back, right, children }) {
 function BottomNav() {
   const { path, navigate } = useHashRoute();
   const items = [
+    { to: '/motivation', label: 'Home', icon: I.star },
     { to: '/', label: 'Days', icon: I.dumbbell },
     { to: '/exercises', label: 'Exercises', icon: I.checkSquare },
     { to: '/history', label: 'History', icon: I.history },
     { to: '/calendar', label: 'Calendar', icon: I.cal },
     { to: '/settings', label: 'Settings', icon: I.settings },
   ];
-  const isActive = (to) => to === '/' ? path === '/' : path.startsWith(to);
+  const isActive = (to) => (to === '/' || to === '/motivation') ? path === to : path.startsWith(to);
   return (
     <nav className="shrink-0 border-t border-neutral-200 bg-white flex safe-bottom">
       {items.map(it => (
@@ -2144,6 +2170,81 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
 }
 
 /* ========================================================================== */
+/* MOTIVATION PAGE — full-screen image tab                                     */
+/* ========================================================================== */
+
+function MotivationPage() {
+  const [imgSrc, setImgSrc] = useState(() => {
+    try { return localStorage.getItem(MOTIV_IMAGE_KEY) || null; } catch (_) { return null; }
+  });
+  const fileRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { alert('Please select an image file.'); return; }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      setImgSrc(dataUrl);
+      try { localStorage.setItem(MOTIV_IMAGE_KEY, dataUrl); } catch (err) {
+        if (err && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED')) {
+          alert('⚠️ Image is too large to store. Try a smaller or more compressed image.');
+          setImgSrc(null);
+        }
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const removeImage = () => {
+    setImgSrc(null);
+    try { localStorage.removeItem(MOTIV_IMAGE_KEY); } catch (_) {}
+  };
+
+  return (
+    <div className="flex flex-col h-full w-full bg-black">
+      {imgSrc ? (
+        <div className="relative flex-1 min-h-0">
+          <img
+            src={imgSrc}
+            alt="Motivation"
+            className="w-full h-full object-contain"
+          />
+          <button
+            onClick={removeImage}
+            className="absolute top-3 right-3 bg-black/50 text-white rounded-full h-8 w-8 flex items-center justify-center hover:bg-black/80 active:bg-black"
+            aria-label="Remove image">
+            {I.x}
+          </button>
+        </div>
+      ) : (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8 text-center">
+          <div className="text-neutral-600">{I.image}</div>
+          <p className="text-neutral-400 text-sm max-w-xs">No image yet. Tap below to pick one from your device.</p>
+          <button
+            onClick={() => fileRef.current && fileRef.current.click()}
+            className="px-5 py-2.5 rounded-xl bg-brand text-white text-sm font-medium hover:bg-brand-dark active:opacity-80">
+            Choose image
+          </button>
+          <p className="text-neutral-600 text-xs">The image is stored locally on this device.</p>
+        </div>
+      )}
+      {imgSrc && (
+        <div className="shrink-0 flex justify-center pb-4 pt-2 bg-black">
+          <button
+            onClick={() => fileRef.current && fileRef.current.click()}
+            className="px-4 py-2 rounded-xl bg-neutral-800 text-neutral-300 text-xs font-medium hover:bg-neutral-700 active:opacity-80">
+            Change image
+          </button>
+        </div>
+      )}
+      <input ref={fileRef} type="file" accept="image/*,image/gif" className="hidden" onChange={handleFile} />
+    </div>
+  );
+}
+
+/* ========================================================================== */
 /* HISTORY                                                                       */
 /* ========================================================================== */
 
@@ -2937,6 +3038,7 @@ function SettingsPage() {
   return (
     <PageShell title="Settings">
       <div className="p-4 space-y-3">
+
         <Card className="p-4">
           <div className="flex items-center justify-between mb-1">
             <h3 className="font-semibold">☁️ Google Sheets Backup</h3>
@@ -2980,7 +3082,8 @@ function AppRouter() {
   const { path } = useHashRoute();
   const seg = path.split('/').filter(Boolean);
 
-  if (seg.length === 0) return <HomePage />;
+  if (path === '/')           return <HomePage />;
+  if (seg[0] === 'motivation') return <MotivationPage />;
   if (seg[0] === 'groups') return <GroupsPage />;
   if (seg[0] === 'exercises') return <ExercisesPage />;
   if (seg[0] === 'day' && seg[1]) return <DayEditorPage id={seg[1]} />;
