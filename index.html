@@ -372,14 +372,13 @@ function PageShell({ title, back, right, children }) {
 function BottomNav() {
   const { path, navigate } = useHashRoute();
   const items = [
-    { to: '/motivation', label: 'Home', icon: I.star },
     { to: '/', label: 'Days', icon: I.dumbbell },
     { to: '/exercises', label: 'Exercises', icon: I.checkSquare },
     { to: '/history', label: 'History', icon: I.history },
     { to: '/calendar', label: 'Calendar', icon: I.cal },
     { to: '/settings', label: 'Settings', icon: I.settings },
   ];
-  const isActive = (to) => (to === '/' || to === '/motivation') ? path === to : path.startsWith(to);
+  const isActive = (to) => to === '/' ? path === '/' : path.startsWith(to);
   return (
     <nav className="shrink-0 border-t border-neutral-200 bg-white flex safe-bottom">
       {items.map(it => (
