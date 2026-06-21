@@ -2489,9 +2489,19 @@ async function backgroundSync(db, opts) {
           });
         }
         if (se.session_note && se.session_note.trim()) {
+          var noteSets = completedSets.length > 0 ? completedSets : sets;
+          var noteReps = noteSets.map(function(ss){
+            return ss.actual_reps != null && ss.actual_reps !== '' ? ss.actual_reps
+              : (se.planned_reps != null ? se.planned_reps : '');
+          }).filter(function(v){ return v !== ''; }).join(', ');
+          var noteWeight = noteSets.map(function(ss){
+            return ss.actual_weight != null && ss.actual_weight !== '' ? ss.actual_weight : '';
+          }).filter(function(v){ return v !== ''; }).join(', ');
           notesRows.push({
             timestamp: sessionTimestamp,
             exercise: ex ? ex.name : '?',
+            reps: noteReps,
+            weight: noteWeight,
             note: se.session_note.trim(),
           });
         }
@@ -3009,6 +3019,28 @@ function SettingsPage() {
     doManualSync('manual-push', 'Saved plans/history to Google Sheets');
   };
 
+  const [separating, setSeparating] = useState(false);
+  const addSeparator = async function() {
+    const url = (typeof SYNCURL !== 'undefined') ? SYNCURL : (localStorage.getItem('liftlog.syncurl') || '');
+    if (!url) { showToast('No sync URL configured'); return; }
+    setSeparating(true);
+    try {
+      const ts = new Date().toISOString();
+      const payload = JSON.stringify({ action: 'separator', timestamp: ts });
+      const body = new URLSearchParams({ payload });
+      const resp = await fetch(url, { method: 'POST', body, redirect: 'follow' });
+      const json = await resp.json().catch(function(){ return {}; });
+      if (json.ok) {
+        showToast('✅ Separator added to Notes sheet');
+      } else {
+        showToast('Failed: ' + (json.error || 'unknown error'));
+      }
+    } catch(err) {
+      showToast('Failed: ' + String(err.message || err));
+    }
+    setSeparating(false);
+  };
+
   const pullFromSheetsNow = async function() {
     var ok = window.confirm(
       'Pull latest spreadsheet-backed plans into this device? This will replace local groups, workout days, and planned day exercises with the spreadsheet version. Exercises will be merged/updated by name. Workout history and calendar data on this phone will stay untouched.'
@@ -3087,6 +3119,18 @@ function SettingsPage() {
             Open spreadsheet
           </Button>
         </Card>
+
+        <Card className="p-4">
+          <h3 className="font-semibold mb-1">📋 PT Notes Separator</h3>
+          <p className="text-xs text-neutral-400 mb-3">
+            After copying your notes to your PT thread, tap this to add a bold black divider
+            (with timestamp) to the Notes sheet — so next time you know exactly where to start copying from.
+          </p>
+          <Button className="w-full text-xs" onClick={addSeparator} disabled={separating}>
+            {separating ? 'Adding...' : '➕ Add separator to Notes sheet'}
+          </Button>
+        </Card>
+
       </div>
     </PageShell>
   );
