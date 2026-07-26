@@ -41,19 +41,27 @@
 </style>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.21.5/babel.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
 
-<script type="text/babel" data-type="module" data-presets="react">
+<script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef, useCallback, createContext, useContext, Fragment } = React;
+
+/* ── App-wide constants (defined early to avoid TDZ errors) ── */
+const SYNCURL = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
+const SHEETURL = 'https://docs.google.com/spreadsheets/d/15XSn9GyAVI2Xi6ujuWtUXvcSpUi4_xOfQElDw0QQG7U/edit?gid=0#gid=0';
+const PENDINGSYNCKEY = 'liftlog.syncpending';
+const SYNCDEBUGKEY = 'liftlog.syncdebug';
+
 
 /* ========================================================================== */
 /* STORAGE — localStorage-backed data layer that mirrors the SQLite schema    */
 /* ========================================================================== */
 
 const STORAGE_KEY = 'liftlog.v1';
+const MOTIV_IMAGE_KEY = 'liftlog.motiv_image';
 
 const emptyDb = () => ({
   exercises: [],
@@ -81,11 +89,19 @@ function loadDb() {
 }
 
 function saveDb(db) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  } catch (e) {
+    if (e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED')) {
+      alert('⚠️ Storage is full — your last change could not be saved.\nPlease go to Settings and export a backup to free up space.');
+    } else {
+      console.error('[LiftLog] saveDb failed:', e);
+    }
+  }
 }
 
 const uuid = () => {
-  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
     return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
@@ -182,15 +198,44 @@ class ErrorBoundary extends React.Component {
 /* HASH ROUTER — minimal, route format /#/path/sub                             */
 /* ========================================================================== */
 
-function useHashRoute() {
-  const [hash, setHash] = useState(window.location.hash || '#/');
+// One-time launch redirect — runs ONCE at app root (see App()), not per-hook.
+// sessionStorage clears when the tab/browser closes, so every new launch starts at the motivation tab.
+function useLaunchRedirect() {
   useEffect(() => {
-    const onChange = () => setHash(window.location.hash || '#/');
+    const launched = sessionStorage.getItem('liftlog.launched');
+    if (!launched) {
+      sessionStorage.setItem('liftlog.launched', '1');
+      window.location.hash = '#/motivation';
+    }
+  }, []);
+}
+
+function useHashRoute() {
+  const [, forceUpdate] = useState(0);
+
+  useEffect(() => {
+    // Subscribe to hash changes only. The launch redirect lives in useLaunchRedirect()
+    // at the app root so it fires exactly once instead of once per consuming component.
+    const onChange = () => forceUpdate(n => n + 1);
     window.addEventListener('hashchange', onChange);
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
-  const path = hash.replace(/^#/, '') || '/';
-  return { path, navigate: (p) => { window.location.hash = '#' + p; } };
+
+  const navigate = (p) => {
+    const next = '#' + p;
+    if (window.location.hash === next) {
+      // Same hash — hashchange won't fire, force update manually
+      forceUpdate(n => n + 1);
+    } else {
+      window.location.hash = next;
+    }
+  };
+
+  const h = window.location.hash;
+  const raw = h.replace(/^#/, '');
+  // Only treat completely empty hash as motivation — '#/' is the Days route
+  const path = !raw ? '/motivation' : raw;
+  return { path, navigate };
 }
 
 /* ========================================================================== */
@@ -224,6 +269,8 @@ const I = {
   history: <Icon d={<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>} />,
   upload: <Icon d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></>} />,
   download: <Icon d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></>} />,
+  image: <Icon d={<><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></>} />,
+  star: <Icon d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />,
 };
 
 /* ========================================================================== */
@@ -669,7 +716,7 @@ function ExercisesPage() {
               <div className="flex-1 min-w-0">
                 <div className="font-medium leading-snug">{ex.name}</div>
                 <div className="text-xs text-neutral-500 flex items-center gap-1">
-                  {ex.kind === 'time' ? <>{I.clock} time</> : <>{I.dumbbell} reps</>}
+                  {(() => { const lt = loggingTypeOf(ex); const labels = { weight: 'weight', band: 'band', bodyweight: 'bodyweight', timer: 'timer', stopwatch: 'stopwatch' }; return <>{lt === 'timer' || lt === 'stopwatch' ? I.clock : I.dumbbell} {labels[lt]}{ex.bilateral ? ' · L/R' : ''}</>; })()}
                   {ex.description && <span className="truncate">· {ex.description}</span>}
                 </div>
               </div>
@@ -740,14 +787,14 @@ function parseBulkExercises(text) {
         fields[k] = v;
       }
 
-      // type: weight | band | bodyweight | timer | stopwatch (optional — inferred from band=/duration= if omitted).
-      // Only used when creating a NEW exercise — never overwrites an existing exercise's type.
-      const typeRaw = (fields['type'] || '').trim().toLowerCase();
-      // sides: lr (aliases accepted) — only used on exercise creation, same rule as type.
-      const sidesRaw = (fields['sides'] || '').trim().toLowerCase();
-      let bilateral = null;
-      if (sidesRaw) bilateral = ['lr', 'l/r', 'left/right', 'leftright', 'both'].includes(sidesRaw);
-      if (bilateral === null && fields['bilateral'] !== undefined) bilateral = parseBool(fields['bilateral']);
+      // Normalize logging type. Accepts: weight | band | bodyweight | timer | stopwatch
+      const rawType = (fields['type'] || '').trim().toLowerCase();
+      const validTypes = ['weight', 'band', 'bodyweight', 'timer', 'stopwatch'];
+      const type = validTypes.includes(rawType) ? rawType : '';
+
+      // Normalize sides. Accepts: lr, l/r, left/right (case-insensitive) -> bilateral true
+      const rawSides = (fields['sides'] || '').trim().toLowerCase();
+      const bilateral = ['lr', 'l/r', 'left/right'].includes(rawSides);
 
       current.items.push({
         name,
@@ -755,13 +802,13 @@ function parseBulkExercises(text) {
         reps: fields['reps'] || '',
         rest: fields['rest'] || '',
         band: fields['band'] || '',
-        weight: fields['weight'] || '',
-        duration: fields['duration'] || '',
         notes: fields['notes'] || '',
         main: parseBool(fields['main']),
         warmup: parseBool(fields['warmup']),
-        type: typeRaw,
-        bilateral,
+        type,
+        duration: fields['duration'] || '',
+        sides: bilateral,
+        weight: fields['weight'] || '',
       });
     }
   }
@@ -786,26 +833,37 @@ function applyBulkExercises(d, parsedBlocks) {
     return rows.reduce((m, r) => Math.max(m, r.sort_order || 0), 0);
   }
 
-  // Derives logging-type flags for a BRAND NEW exercise from the bulk item.
-  // Explicit type= wins; otherwise inferred from band=/duration= presence.
-  // NOTE: this is only ever applied when creating a new exercise (see below) —
-  // existing exercises keep whatever type was set in the app, bulk import never overwrites it.
-  function resolveTypeFlags(item) {
-    let type = item.type;
-    if (!type) {
-      if (item.band) type = 'band';
-      else if (item.duration) type = 'timer';
-    }
-    const flags = { kind: 'reps', use_band: false, bodyweight: false, timer_mode: 'countdown' };
-    if (type === 'band') { flags.use_band = true; }
-    else if (type === 'bodyweight') { flags.bodyweight = true; }
-    else if (type === 'timer') { flags.kind = 'time'; flags.timer_mode = 'countdown'; }
-    else if (type === 'stopwatch') { flags.kind = 'time'; flags.timer_mode = 'stopwatch'; }
-    return flags;
-  }
-
   const exByName = new Map();
   d.exercises.forEach(ex => exByName.set(norm(ex.name), ex));
+
+  // Derive the exercise-level fields (kind/use_band/bodyweight/timer_mode/bilateral)
+  // from the parsed type + sides for a given bulk item.
+  function deriveExerciseFields(item) {
+    const out = { kind: 'reps', use_band: false, bodyweight: false, timer_mode: null };
+    switch (item.type) {
+      case 'band':
+        out.kind = 'reps';
+        out.use_band = true;
+        break;
+      case 'bodyweight':
+        out.kind = 'reps';
+        out.bodyweight = true;
+        break;
+      case 'timer':
+        out.kind = 'time';
+        out.timer_mode = 'countdown';
+        break;
+      case 'stopwatch':
+        out.kind = 'time';
+        out.timer_mode = 'stopwatch';
+        break;
+      case 'weight':
+      default:
+        out.kind = 'reps';
+        break;
+    }
+    return out;
+  }
 
   parsedBlocks.forEach(block => {
     const dayName = String(block.dayName || '').trim();
@@ -820,6 +878,7 @@ function applyBulkExercises(d, parsedBlocks) {
         id: uuid(),
         name: groupName,
         sort_order: maxSort(d.groups) + 1,
+        created_at: nowSec(),
       };
       d.groups.push(group);
     }
@@ -835,6 +894,7 @@ function applyBulkExercises(d, parsedBlocks) {
         name: dayName,
         group_id: group.id,
         sort_order: maxDaySortInGroup + 1,
+        created_at: nowSec(),
       };
       d.workout_days.push(day);
     }
@@ -845,27 +905,36 @@ function applyBulkExercises(d, parsedBlocks) {
       const key = norm(item.name);
       if (!key) return;
 
+      const derived = deriveExerciseFields(item);
+
       let ex = exByName.get(key);
       if (!ex) {
-        // New exercise: apply type/sides derived from this import line.
-        const typeFlags = resolveTypeFlags(item);
         ex = {
           id: uuid(),
           name: item.name,
-          kind: typeFlags.kind,
-          use_band: typeFlags.use_band,
-          bodyweight: typeFlags.bodyweight,
-          timer_mode: typeFlags.timer_mode,
-          bilateral: item.bilateral === true,
+          kind: derived.kind,
+          use_band: derived.use_band,
+          bodyweight: derived.bodyweight,
+          timer_mode: derived.timer_mode,
+          bilateral: item.sides,
           description: item.notes || '',
           persistent_notes: item.notes || '',
           youtube_url: '',
           archived: 0,
+          created_at: nowSec(),
         };
         d.exercises.push(ex);
         exByName.set(key, ex);
       } else {
-        // Existing exercise: never change its type/sides via bulk import — only notes.
+        // Update type/sides on re-import so existing exercises stay in sync
+        // with the latest plan coming from the PT thread.
+        if (item.type) {
+          ex.kind = derived.kind;
+          ex.use_band = derived.use_band;
+          ex.bodyweight = derived.bodyweight;
+          ex.timer_mode = derived.timer_mode;
+        }
+        if (item.sides) ex.bilateral = true;
         if (item.notes) ex.description = item.notes;
         if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
       }
@@ -899,12 +968,17 @@ function applyBulkExercises(d, parsedBlocks) {
       if (item.reps) de.planned_reps = item.reps;
       if (item.band) {
         de.band_hint = item.band;
-        if (!de.planned_weight) de.planned_weight = item.band;
       }
-      if (item.weight && !ex.use_band) de.planned_weight = item.weight;
-      if (item.duration) {
-        const dsec = parseInt(String(item.duration).replace(/[^0-9]/g, ''), 10);
-        if (!isNaN(dsec)) de.planned_duration_sec = dsec;
+      // Explicit starting weight always takes priority; fall back to band label
+      // only when no numeric/text weight was given.
+      if (item.weight) {
+        de.planned_weight = item.weight;
+      } else if (item.band && !de.planned_weight) {
+        de.planned_weight = item.band;
+      }
+      if (item.type === 'timer' && item.duration) {
+        const durNum = parseInt(String(item.duration).split('-')[0], 10);
+        if (!isNaN(durNum)) de.planned_duration_sec = durNum;
       }
       if (item.rest) de.rest_hint = item.rest;
       if (item.notes) de.notes = item.notes;
@@ -923,17 +997,17 @@ function BulkExerciseImportModal({ open, onClose }) {
   const example = [
     'DAY: Small Day D',
     'GROUP: Shoulder Rehab',
-    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | rest=30s | notes=easy warmup | main=false | warmup=true',
-    'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
-    'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | rest=45s | notes=gently back and down | main=false | warmup=false',
-    'EXERCISE: Push-Up | sets=3 | reps=10-15 | type=bodyweight | notes=full range | main=true | warmup=false',
-    'EXERCISE: Side Plank | sets=2 | type=stopwatch | sides=lr | notes=hold as long as possible | main=true | warmup=false',
-    'EXERCISE: Wall Sit | sets=2 | type=timer | duration=45 | notes=knees at 90 | main=true | warmup=false',
+    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | rest=30s | notes=easy warmup | main=false | warmup=true',
+    'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
+    'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
+    'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
+    'EXERCISE: Front Plank Hold | sets=3 | type=stopwatch | rest=60s | notes=brace core | main=true | warmup=false',
+    'EXERCISE: Dead Bug Hold | sets=3 | reps=1 | type=timer | duration=20 | sides=lr | rest=30s | notes=keep low back flat | main=false | warmup=false',
     '',
     'DAY: Small Day E',
     'GROUP: Shoulder Rehab',
-    'EXERCISE: Shoulder CARs | sets=1 | reps=5/side | rest=30s | notes=slow circles | main=false | warmup=true',
-    'EXERCISE: Sidelying ER | sets=2 | reps=12-15 | rest=45s | notes=control the lowering | main=true | warmup=false',
+    'EXERCISE: Shoulder CARs | sets=1 | reps=5/side | type=bodyweight | sides=lr | rest=30s | notes=slow circles | main=false | warmup=true',
+    'EXERCISE: Sidelying ER | sets=2 | reps=12-15 | type=weight | weight=5kg | sides=lr | rest=45s | notes=control the lowering | main=true | warmup=false',
   ].join('\n');
 
   if (!open) return null;
@@ -970,12 +1044,7 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Existing days and exercises will be merged and updated, without duplicates.</p>
-        <p className="text-xs text-neutral-500">
-          Optional fields: <code>type=</code> weight|band|bodyweight|timer|stopwatch (auto-detected from <code>band=</code>/<code>duration=</code> if omitted),{' '}
-          <code>sides=</code> lr, <code>duration=</code> seconds (timer only), <code>weight=</code> starting weight.
-          These only apply when creating a brand-new exercise — re-importing never changes the type of an exercise that already exists.
-        </p>
+        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Supports type=weight|band|bodyweight|timer|stopwatch, sides=lr, duration (secs, timer only), weight, band, rest, notes, main, warmup. Existing days and exercises will be merged and updated, without duplicates.</p>
         <textarea
           rows={12}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
@@ -995,14 +1064,49 @@ function BulkExerciseImportModal({ open, onClose }) {
     </Modal>
   );
 }
-
 function ExerciseEditor({ open, value, onClose, onSave }) {
   const [v, setV] = useState(value || {});
   useEffect(() => { setV(value || {}); }, [value]);
 
   if (!open) return null;
 
-  const isTime = (v.kind || 'reps') === 'time';
+  const loggingType = loggingTypeOf(v);
+
+  const setLoggingType = (type) => {
+    if (type === 'weight') setV({ ...v, kind: 'reps', use_band: false, bodyweight: false });
+    else if (type === 'band') setV({ ...v, kind: 'reps', use_band: true, bodyweight: false });
+    else if (type === 'bodyweight') setV({ ...v, kind: 'reps', use_band: false, bodyweight: true });
+    else if (type === 'timer') setV({ ...v, kind: 'time', timer_mode: 'countdown' });
+    else if (type === 'stopwatch') setV({ ...v, kind: 'time', timer_mode: 'stopwatch' });
+  };
+
+  const TypeBtn = ({ type, label }) => (
+    <button
+      type="button"
+      onClick={() => setLoggingType(type)}
+      className={`px-2.5 py-2 rounded-lg text-xs font-medium border transition ${
+        loggingType === type
+          ? 'bg-brand text-white border-brand'
+          : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-50'
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  const SideBtn = ({ val, label }) => (
+    <button
+      type="button"
+      onClick={() => setV({ ...v, bilateral: val })}
+      className={`flex-1 px-2.5 py-2 rounded-lg text-xs font-medium border transition ${
+        (!!v.bilateral) === val
+          ? 'bg-brand text-white border-brand'
+          : 'bg-white text-neutral-700 border-neutral-300 hover:bg-neutral-50'
+      }`}
+    >
+      {label}
+    </button>
+  );
 
   return (
     <Modal
@@ -1025,44 +1129,22 @@ function ExerciseEditor({ open, value, onClose, onSave }) {
 
       <div className="h-3" />
 
-      <Label>Type</Label>
-      <Select
-        value={v.kind || 'reps'}
-        onChange={e => setV({ ...v, kind: e.target.value, bilateral: false, use_band: false })}
-      >
-        <option value="reps">Reps (sets × reps × weight)</option>
-        <option value="time">Time (duration)</option>
-      </Select>
+      <Label>Logging type</Label>
+      <div className="grid grid-cols-3 gap-2">
+        <TypeBtn type="weight" label="Weight" />
+        <TypeBtn type="band" label="Band" />
+        <TypeBtn type="bodyweight" label="Bodyweight" />
+        <TypeBtn type="timer" label="Timer" />
+        <TypeBtn type="stopwatch" label="Stopwatch" />
+      </div>
 
-      {isTime && (
-        <>
-          <div className="h-3" />
-          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={!!v.bilateral}
-              onChange={e => setV({ ...v, bilateral: e.target.checked })}
-              className="w-4 h-4 accent-green-600"
-            />
-            Bilateral (separate L / R timers)
-          </label>
-        </>
-      )}
+      <div className="h-3" />
 
-      {!isTime && (
-        <>
-          <div className="h-3" />
-          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={!!v.use_band}
-              onChange={e => setV({ ...v, use_band: e.target.checked })}
-              className="w-4 h-4 accent-green-600"
-            />
-            Band exercise (log band type instead of weight)
-          </label>
-        </>
-      )}
+      <Label>Sides</Label>
+      <div className="flex gap-2">
+        <SideBtn val={false} label="Single" />
+        <SideBtn val={true} label="Left / Right" />
+      </div>
 
       <div className="h-3" />
 
@@ -1093,6 +1175,7 @@ function ExerciseEditor({ open, value, onClose, onSave }) {
     </Modal>
   );
 }
+
 /* ========================================================================== */
 /* DAY EDITOR — list + reorder + supersets + add exercise                       */
 /* ========================================================================== */
@@ -1149,9 +1232,12 @@ function DayEditorPage({ id }) {
       // Move all selected to be contiguous: keep original order, append non-selected after
       const selected = dayDesSorted.filter(de => selSet.has(de.id));
       const nonSel = dayDesSorted.filter(de => !selSet.has(de.id));
-      // Insert selected at the position of the first-selected
+      // Insert selected at the position of the first-selected item.
+      // firstSelIdx is the index in the full list; we need the equivalent index
+      // in nonSel (i.e. how many non-selected items come before the first selected one).
       const firstSelIdx = dayDesSorted.findIndex(de => selSet.has(de.id));
-      const reordered = [...nonSel.slice(0, firstSelIdx), ...selected, ...nonSel.slice(firstSelIdx)];
+      const insertAt = dayDesSorted.slice(0, firstSelIdx).filter(de => !selSet.has(de.id)).length;
+      const reordered = [...nonSel.slice(0, insertAt), ...selected, ...nonSel.slice(insertAt)];
       reordered.forEach((de, i) => {
         const t = d.day_exercises.find(x => x.id === de.id);
         if (t) {
@@ -1201,7 +1287,6 @@ function DayEditorPage({ id }) {
     if (!ok) return;
     mutate(d => {
       d.workout_days = d.workout_days.filter(x => x.id !== id);
-      const desRemoved = d.day_exercises.filter(de => de.day_id === id).map(de => de.id);
       d.day_exercises = d.day_exercises.filter(de => de.day_id !== id);
       d.supersets = d.supersets.filter(s => s.day_id !== id);
       return d;
@@ -1340,10 +1425,13 @@ function AddExerciseModal({ open, onClose, dayId }) {
   useEffect(() => { if (open) { setExId(''); setSets(3); setReps('8-10'); setWeight(''); setDur(30); setNotes(''); } }, [open]);
 
   const ex = db.exercises.find(e => e.id === exId);
+  const isTime = ex?.kind === 'time';
+  const isStopwatch = isTime && ex?.timer_mode === 'stopwatch';
+  const isBand = !isTime && !!ex?.use_band;
+  const isBodyweight = !isTime && !isBand && !!ex?.bodyweight;
 
   const save = () => {
     if (!ex) return;
-    const isTime = ex.kind === 'time';
     mutate(d => {
       const dayDes = d.day_exercises.filter(de => de.day_id === dayId);
       d.day_exercises.push({
@@ -1378,11 +1466,15 @@ function AddExerciseModal({ open, onClose, dayId }) {
           <Label>Sets</Label>
           <Input type="number" min="1" value={sets} onChange={e => setSets(e.target.value)} />
         </div>
-        {ex?.kind === 'time' ? (
-          <div>
-            <Label>Duration (sec)</Label>
-            <Input type="number" min="1" value={dur} onChange={e => setDur(e.target.value)} />
-          </div>
+        {isTime ? (
+          isStopwatch ? (
+            <div className="text-xs text-neutral-500 flex items-center">Max-hold stopwatch — no fixed duration</div>
+          ) : (
+            <div>
+              <Label>Duration (sec)</Label>
+              <Input type="number" min="1" value={dur} onChange={e => setDur(e.target.value)} />
+            </div>
+          )
         ) : (
           <div>
             <Label>Reps</Label>
@@ -1390,16 +1482,16 @@ function AddExerciseModal({ open, onClose, dayId }) {
           </div>
         )}
       </div>
-      {ex?.kind !== 'time' && (
+      {!isTime && !isBodyweight && (
         <>
           <div className="h-3" />
-          <Label>{ex?.use_band ? 'Band' : 'Weight'}</Label>
+          <Label>{isBand ? 'Band' : 'Weight'}</Label>
           <Input
             type="text"
-            inputMode={ex?.use_band ? 'text' : 'decimal'}
+            inputMode={isBand ? 'text' : 'decimal'}
             value={weight}
             onChange={e => setWeight(e.target.value)}
-            placeholder={ex?.use_band ? 'e.g. red, heavy, green + light' : '60kg'} />
+            placeholder={isBand ? 'e.g. red, heavy, green + light' : '60kg'} />
         </>
       )}
       <div className="h-3" />
@@ -1417,6 +1509,9 @@ function DayExerciseEditor({ open, deId, onClose }) {
   useEffect(() => { if (de) setV({ ...de }); }, [deId]);
   if (!open || !de || !ex) return null;
   const isTime = ex.kind === 'time';
+  const isStopwatch = isTime && ex.timer_mode === 'stopwatch';
+  const isBand = !isTime && !!ex.use_band;
+  const isBodyweight = !isTime && !isBand && !!ex.bodyweight;
   return (
     <Modal open={open} onClose={onClose} title={`Edit · ${ex.name}`}
       footer={<><Button variant="outline" onClick={onClose}>Cancel</Button>
@@ -1430,10 +1525,14 @@ function DayExerciseEditor({ open, deId, onClose }) {
           <Input type="number" min="1" value={v.planned_sets || ''} onChange={e => setV({ ...v, planned_sets: Number(e.target.value) || 1 })} />
         </div>
         {isTime ? (
-          <div>
-            <Label>Duration (sec)</Label>
-            <Input type="number" min="1" value={v.planned_duration_sec || ''} onChange={e => setV({ ...v, planned_duration_sec: Number(e.target.value) || 0 })} />
-          </div>
+          isStopwatch ? (
+            <div className="text-xs text-neutral-500 flex items-center">Max-hold stopwatch — no fixed duration</div>
+          ) : (
+            <div>
+              <Label>Duration (sec)</Label>
+              <Input type="number" min="1" value={v.planned_duration_sec || ''} onChange={e => setV({ ...v, planned_duration_sec: Number(e.target.value) || 0 })} />
+            </div>
+          )
         ) : (
           <div>
             <Label>Reps</Label>
@@ -1441,16 +1540,16 @@ function DayExerciseEditor({ open, deId, onClose }) {
           </div>
         )}
       </div>
-      {!isTime && (
+      {!isTime && !isBodyweight && (
         <>
           <div className="h-3" />
-          <Label>{ex?.use_band ? 'Band' : 'Weight'}</Label>
+          <Label>{isBand ? 'Band' : 'Weight'}</Label>
           <Input
             type="text"
-            inputMode={ex?.use_band ? 'text' : 'decimal'}
+            inputMode={isBand ? 'text' : 'decimal'}
             value={v.planned_weight || ''}
             onChange={e => setV({ ...v, planned_weight: e.target.value })}
-            placeholder={ex?.use_band ? 'e.g. red, heavy, green + light' : ''} />
+            placeholder={isBand ? 'e.g. red, heavy, green + light' : ''} />
         </>
       )}
       <div className="h-3" />
@@ -1459,6 +1558,7 @@ function DayExerciseEditor({ open, deId, onClose }) {
     </Modal>
   );
 }
+
 
 /* ========================================================================== */
 /* SESSION START                                                                */
@@ -1477,17 +1577,55 @@ function getExerciseDefaultsMap(db) {
     for (const se of ses) {
       if (map.has(se.exercise_id)) continue;
       const sets = (db.session_sets || [])
-        .filter(ss => ss.session_exercise_id === se.id && ss.completed)
+        .filter(ss => ss.session_exercise_id === se.id)
         .sort((a, b) => a.set_number - b.set_number);
-      const lastSet = sets[sets.length - 1];
+      const completedSets = sets.filter(ss => ss.completed);
+      const allSets = completedSets.length > 0 ? completedSets : sets;
+      const lastSet = allSets[allSets.length - 1];
       map.set(se.exercise_id, {
+        // Per-set values: array of {reps, weight} for each set position
+        sets: allSets.map(ss => ({
+          reps:   ss.actual_reps   ?? null,
+          weight: ss.actual_weight ?? null,
+          duration_sec: ss.actual_duration_sec ?? null,
+        })),
+        // Fallbacks for single values (used for planned fields)
         reps:         (lastSet?.actual_reps   ?? se.planned_reps)         || null,
         weight:       (lastSet?.actual_weight ?? se.planned_weight)       || null,
         duration_sec: (lastSet?.actual_duration_sec ?? se.planned_duration_sec) || null,
+        // Last note written for this exercise
+        note: se.session_note || null,
       });
     }
   }
   return map;
+}
+
+function loggingTypeOf(ex) {
+  if (!ex) return 'weight';
+  if ((ex.kind || 'reps') === 'time') {
+    return ex.timer_mode === 'stopwatch' ? 'stopwatch' : 'timer';
+  }
+  if (ex.use_band) return 'band';
+  if (ex.bodyweight) return 'bodyweight';
+  return 'weight';
+}
+
+// Scans finished sessions for the best (max) isometric hold time for an exercise.
+// Returns { overall, left, right } in seconds, or null if no data exists yet.
+function getBestHoldForExercise(db, exerciseId) {
+  const ses = (db.session_exercises || []).filter(se => se.exercise_id === exerciseId);
+  if (!ses.length) return null;
+  const seIds = new Set(ses.map(se => se.id));
+  const sets = (db.session_sets || []).filter(s => seIds.has(s.session_exercise_id));
+  let overall = 0, left = 0, right = 0;
+  sets.forEach(s => {
+    if (typeof s.actual_duration_sec === 'number' && s.actual_duration_sec > overall) overall = s.actual_duration_sec;
+    if (typeof s.actual_duration_sec_left === 'number' && s.actual_duration_sec_left > left) left = s.actual_duration_sec_left;
+    if (typeof s.actual_duration_sec_right === 'number' && s.actual_duration_sec_right > right) right = s.actual_duration_sec_right;
+  });
+  if (!overall && !left && !right) return null;
+  return { overall: overall || null, left: left || null, right: right || null };
 }
 
 function startSession(db, mutate, dayId, navigate, showToast) {
@@ -1526,18 +1664,25 @@ function startSession(db, mutate, dayId, navigate, showToast) {
         planned_duration_sec: prefillDur,
         superset_label: de.superset_id ? (ssLabelById.get(de.superset_id) || null) : null,
         superset_key: de.superset_id || null,
-        session_note: null,
+        session_note: defs.note || null,
       });
       const n = de.planned_sets || 1;
+      const prevSets = defs.sets || [];
       for (let i = 1; i <= n; i++) {
+        // Prefill from the matching set position of the last session (i-1 index).
+        // If the previous session had fewer sets, fall back to the last available set.
+        const prevIdx = Math.min(i - 1, prevSets.length - 1);
+        const prev = prevSets.length > 0 ? prevSets[prevIdx] : null;
         d.session_sets.push({
           id: uuid(),
           session_exercise_id: seId,
           set_number: i,
-          actual_reps: null,
-          actual_weight: null,
+          actual_reps: prev?.reps ?? null,
+          actual_weight: prev?.weight ?? null,
           completed: 0,
-          actual_duration_sec: null,
+          actual_duration_sec: prev?.duration_sec ?? null,
+          actual_duration_sec_left: null,
+          actual_duration_sec_right: null,
         });
       }
     });
@@ -1608,13 +1753,29 @@ function SessionPage({ id }) {
   const ses = db.session_exercises.filter(se => se.session_id === id).slice().sort((a, b) => a.position - b.position);
   const allDone = ses.length > 0 && ses.every(se => se.completed);
 
+  // ── Live stopwatch ────────────────────────────────────────────────────────
+  const [elapsed, setElapsed] = useState(() => nowSec() - (session.started_at || nowSec()));
+  useEffect(() => {
+    const t = setInterval(() => setElapsed(nowSec() - (session.started_at || nowSec())), 1000);
+    return () => clearInterval(t);
+  }, [session.started_at]);
+  const fmtElapsed = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    return `${m}:${String(s).padStart(2,'0')}`;
+  };
+
   const finish = async () => {
     const ok = await confirm({ title: 'Finish session?', message: allDone ? 'Mark this session as complete?' : 'Some exercises are not marked complete. Finish anyway?', confirmLabel: 'Finish' });
     if (!ok) return;
     releaseWake();
     // Step 1: save locally — always immediate, never blocked by network
-    mutate(d => { const t = d.sessions.find(x => x.id === id); if (t) { t.is_finished = 1; t.finished_at = nowSec(); } return d; });
-    showToast('Workout saved');
+    const finishedAt = nowSec();
+    const durationSec = finishedAt - (session.started_at || finishedAt);
+    mutate(d => { const t = d.sessions.find(x => x.id === id); if (t) { t.is_finished = 1; t.finished_at = finishedAt; t.duration_sec = durationSec; } return d; });
+    showToast(`Workout done in ${fmtElapsed(durationSec)} 💪`);
     navigate('/history');
     // Step 2: background sync — non-blocking, fires 600ms later so localStorage is flushed
     setTimeout(function() {
@@ -1665,8 +1826,13 @@ function SessionPage({ id }) {
         superset_label: null, superset_key: null, session_note: null,
       });
       const n = Number(numSets) || 1;
+      const addDefMap = getExerciseDefaultsMap(d);
+      const addDefs = addDefMap.get(exObj.id) || {};
+      const addPrevSets = addDefs.sets || [];
       for (let i = 1; i <= n; i++) {
-        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
+        const prevIdx = Math.min(i - 1, addPrevSets.length - 1);
+        const addPrev = addPrevSets.length > 0 ? addPrevSets[prevIdx] : null;
+        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: addPrev?.reps ?? null, actual_weight: addPrev?.weight ?? null, completed: 0, actual_duration_sec: addPrev?.duration_sec ?? null, actual_duration_sec_left: null, actual_duration_sec_right: null });
       }
       return d;
     });
@@ -1693,7 +1859,7 @@ function SessionPage({ id }) {
       d.session_sets = d.session_sets.filter(s => s.session_exercise_id !== seId);
       const n = se.planned_sets || 1;
       for (let i = 1; i <= n; i++) {
-        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
+        d.session_sets.push({ id: uuid(), session_exercise_id: seId, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null, actual_duration_sec_left: null, actual_duration_sec_right: null });
       }
       return d;
     });
@@ -1703,7 +1869,10 @@ function SessionPage({ id }) {
 
   return (
     <PageShell title={day?.name || 'Session'} back={null}
-      right={<button onClick={cancel} className="p-2 text-red-600" aria-label="Cancel">{I.x}</button>}>
+      right={<div className="flex items-center gap-2">
+        <span className="text-sm font-mono font-medium text-neutral-500">{fmtElapsed(elapsed)}</span>
+        <button onClick={cancel} className="p-2 text-red-600" aria-label="Cancel">{I.x}</button>
+      </div>}>
       <div className="p-4 space-y-3 pb-36">
         {ses.map(se => <SessionExercise key={se.id} se={se} onReplace={() => setReplaceSeId(se.id)} />)}
         <button onClick={() => setShowAddEx(true)}
@@ -1722,9 +1891,21 @@ function SessionPage({ id }) {
 }
 
 function SessionExercise({ se, onReplace }) {
-  const { db, mutate } = useApp();
+  const { db, mutate, showToast } = useApp();
   const ex = db.exercises.find(e => e.id === se.exercise_id);
   const sets = db.session_sets.filter(s => s.session_exercise_id === se.id).slice().sort((a, b) => a.set_number - b.set_number);
+
+  // Compute last-session values for the "last time" reference badge
+  const lastDefs = useMemo(() => {
+    const map = getExerciseDefaultsMap(db);
+    return map.get(se.exercise_id) || null;
+  }, [db, se.exercise_id]);
+
+  // Best-ever hold time for isometric exercises (derived, never stored redundantly)
+  const bestHold = useMemo(() => {
+    if (!ex || ex.kind !== 'time') return null;
+    return getBestHoldForExercise(db, se.exercise_id);
+  }, [db, ex, se.exercise_id]);
 
   const updateSet = (setId, patch) => {
     mutate(d => {
@@ -1802,30 +1983,45 @@ function SessionExercise({ se, onReplace }) {
       if (next === current) return d;
       if (next > current) {
         for (let i = current + 1; i <= next; i++) {
-          d.session_sets.push({ id: uuid(), session_exercise_id: se.id, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null });
+          d.session_sets.push({ id: uuid(), session_exercise_id: se.id, set_number: i, actual_reps: null, actual_weight: null, completed: 0, actual_duration_sec: null, actual_duration_sec_left: null, actual_duration_sec_right: null });
         }
       } else {
+        // Only remove empty (not-yet-completed) sets. Completed sets hold logged
+        // data (reps/weight/duration) and must never be silently discarded — if
+        // the user really wants to drop a logged set, they clear it first, then
+        // remove it. So the removal is capped at the number of empty sets.
         const removable = [...existing].reverse().filter(s => !s.completed);
-        const toRemove = removable.slice(0, current - next).map(s => s.id);
-        if (toRemove.length < current - next) {
-          const completed = [...existing].reverse().filter(s => s.completed);
-          const extra = completed.slice(0, (current - next) - toRemove.length).map(s => s.id);
-          toRemove.push(...extra);
+        const wanted = current - next;
+        const toRemove = removable.slice(0, wanted).map(s => s.id);
+        if (toRemove.length === 0) {
+          // Every set is completed — refuse and tell the user why.
+          if (typeof showToast === 'function') showToast('Clear a set before removing it');
+          return d;
         }
         const removeSet = new Set(toRemove);
         d.session_sets = d.session_sets.filter(s => !removeSet.has(s.id));
         d.session_sets.filter(s => s.session_exercise_id === se.id).sort((a, b) => a.set_number - b.set_number).forEach((s, i) => { s.set_number = i + 1; });
+        if (toRemove.length < wanted && typeof showToast === 'function') {
+          showToast('Removed empty sets only — completed sets kept');
+        }
       }
       const se_row = d.session_exercises.find(x => x.id === se.id);
-      if (se_row) se_row.planned_sets = next;
+      // Keep planned_sets in step with what actually remains (removal may have
+      // been capped by completed sets, so recompute from the real count).
+      if (se_row) {
+        const remaining = d.session_sets.filter(s => s.session_exercise_id === se.id).length;
+        se_row.planned_sets = (delta > 0) ? next : remaining;
+      }
       return d;
     });
   };
 
    if (!ex) return null;
   const isTime = se.kind === 'time';
+  const isStopwatch = isTime && ex.timer_mode === 'stopwatch';
   const isBilateral = isTime && !!ex.bilateral;
   const useBand = !isTime && !!ex.use_band;
+  const isBodyweight = !isTime && !useBand && !!ex.bodyweight;
   const loadPlaceholder = useBand ? 'band' : 'weight';
   const youtubeUrl = (ex.youtube_url || '').trim();
 
@@ -1836,7 +2032,7 @@ function SessionExercise({ se, onReplace }) {
         <div className="flex-1 min-w-0">
           <div className="font-medium leading-snug">{ex.name}</div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-            <span className="text-xs text-neutral-500">Plan: {se.planned_reps || (isTime ? `${se.planned_duration_sec}s` : '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
+            <span className="text-xs text-neutral-500">Plan: {se.planned_reps || (isTime ? (isStopwatch ? 'max hold' : `${se.planned_duration_sec}s`) : '—')}{useBand ? ' (band)' : ''}{isBilateral ? ' · L+R' : ''}</span>
             <div className="flex items-center gap-1 ml-auto">
               <button onClick={() => changeSetCount(-1)} className="h-6 w-6 rounded bg-neutral-100 text-neutral-600 flex items-center justify-center text-base font-bold leading-none hover:bg-neutral-200 active:bg-neutral-300" aria-label="Remove set">−</button>
               <span className="text-xs font-medium w-12 text-center">{sets.length} set{sets.length !== 1 ? 's' : ''}</span>
@@ -1866,21 +2062,55 @@ function SessionExercise({ se, onReplace }) {
 
       {isTime ? (
         <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Label className="mb-0 text-xs text-neutral-500">Duration (s)</Label>
-            <Input type="number" min="1" className="h-9 w-24"
-              value={se.planned_duration_sec || 30}
-              onChange={e => setPlannedDuration(e.target.value)}
-              data-testid={`input-duration-${se.id}`} />
-            <div className="text-xs text-neutral-400">saved for next time</div>
-          </div>
-          {isBilateral
-            ? sets.map(s => <BilateralTimeSetRow key={s.id} s={s} plannedSec={se.planned_duration_sec || 30} updateSet={updateSet} onComplete={autoCompleteIfAllDone} />)
-            : sets.map(s => <TimeSetRow key={s.id} s={s} plannedSec={se.planned_duration_sec || 30} updateSet={updateSet} onComplete={autoCompleteIfAllDone} />)
+          {isStopwatch ? (
+            <div className="flex items-center gap-2">
+              <Label className="mb-0 text-xs text-neutral-500">Stopwatch — hold as long as you can</Label>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <Label className="mb-0 text-xs text-neutral-500">Duration (s)</Label>
+              <Input type="number" min="1" className="h-9 w-24"
+                value={se.planned_duration_sec || 30}
+                onChange={e => setPlannedDuration(e.target.value)}
+                data-testid={`input-duration-${se.id}`} />
+              <div className="text-xs text-neutral-400">saved for next time</div>
+            </div>
+          )}
+          {bestHold && (
+            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-700 text-xs font-medium">
+              {I.star}
+              {isBilateral
+                ? <span>Best: {bestHold.left ? `L ${bestHold.left}s` : ''}{bestHold.left && bestHold.right ? ' · ' : ''}{bestHold.right ? `R ${bestHold.right}s` : ''}{!bestHold.left && !bestHold.right && bestHold.overall ? `${bestHold.overall}s` : ''}</span>
+                : <span>Best: {bestHold.overall}s</span>
+              }
+            </div>
+          )}
+          {isStopwatch
+            ? (isBilateral
+                ? sets.map(s => <BilateralStopwatchSetRow key={s.id} s={s} updateSet={updateSet} onComplete={autoCompleteIfAllDone} bestLeft={bestHold?.left} bestRight={bestHold?.right} />)
+                : sets.map(s => <StopwatchSetRow key={s.id} s={s} updateSet={updateSet} onComplete={autoCompleteIfAllDone} best={bestHold?.overall} />))
+            : (isBilateral
+                ? sets.map(s => <BilateralTimeSetRow key={s.id} s={s} plannedSec={se.planned_duration_sec || 30} updateSet={updateSet} onComplete={autoCompleteIfAllDone} />)
+                : sets.map(s => <TimeSetRow key={s.id} s={s} plannedSec={se.planned_duration_sec || 30} updateSet={updateSet} onComplete={autoCompleteIfAllDone} />))
           }
         </div>
       ) : (
         <div className="space-y-1.5">
+          {lastDefs && lastDefs.sets && lastDefs.sets.length > 0 && (
+            <div className="flex items-center gap-1.5 px-1 py-1 rounded-md bg-neutral-50 border border-neutral-200">
+              <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wide shrink-0">Last</span>
+              <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+                {lastDefs.sets.map((ps, i) => (
+                  <span key={i} className="text-[11px] text-neutral-500">
+                    <span className="font-medium text-neutral-600">#{i+1}</span>
+                    {ps.reps != null && ps.reps !== '' ? ` ${ps.reps}` : ''}
+                    {!isBodyweight && ps.weight != null && ps.weight !== '' ? ` @ ${ps.weight}` : ''}
+                    {(ps.reps == null || ps.reps === '') && (isBodyweight || ps.weight == null || ps.weight === '') ? ' —' : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
           {sets.map(s => (
             <div key={s.id} className="flex items-center gap-2">
               <div className="w-6 text-xs text-neutral-500 shrink-0">#{s.set_number}</div>
@@ -1895,17 +2125,19 @@ function SessionExercise({ se, onReplace }) {
                   if (s.set_number === 1) autofillFromFirst('actual_reps');
                 }}
               />
-              <Input
-                className="flex-1 h-9 min-w-0"
-                placeholder={loadPlaceholder}
-                type="text"
-                inputMode={useBand ? 'text' : 'decimal'}
-                value={s.actual_weight ?? ''}
-                onChange={e => updateSet(s.id, { actual_weight: e.target.value })}
-                onBlur={() => {
-                  if (s.set_number === 1) autofillFromFirst('actual_weight');
-                }}
-              />
+              {!isBodyweight && (
+                <Input
+                  className="flex-1 h-9 min-w-0"
+                  placeholder={loadPlaceholder}
+                  type="text"
+                  inputMode={useBand ? 'text' : 'decimal'}
+                  value={s.actual_weight ?? ''}
+                  onChange={e => updateSet(s.id, { actual_weight: e.target.value })}
+                  onBlur={() => {
+                    if (s.set_number === 1) autofillFromFirst('actual_weight');
+                  }}
+                />
+              )}
               <button onClick={() => { updateSet(s.id, { completed: s.completed ? 0 : 1 }); setTimeout(autoCompleteIfAllDone, 0); }}
                 className={`shrink-0 h-9 w-9 rounded-md flex items-center justify-center ${s.completed ? 'bg-brand text-white' : 'bg-neutral-100 text-neutral-500'}`}>{I.check}</button>
             </div>
@@ -1914,7 +2146,8 @@ function SessionExercise({ se, onReplace }) {
       )}
 
       <div className="mt-2">
-        <Textarea rows="2" placeholder="Note for this session (optional)"
+        <Textarea rows="2"
+          placeholder={lastDefs?.note ? `Last: ${lastDefs.note}` : 'Note for this session (optional)'}
           value={se.session_note || ''} onChange={e => setNote(e.target.value)}
           data-testid={`textarea-note-${se.id}`} />
       </div>
@@ -1992,7 +2225,9 @@ function SessionAddExerciseModal({ open, onClose, onAdd, db }) {
   useEffect(() => { if (open) { setExId(''); setSets(3); setReps('8-10'); setWeight(''); setDur(30); } }, [open]);
   const ex = db.exercises.find(e => e.id === exId);
   const isTime = ex?.kind === 'time';
+  const isStopwatch = isTime && ex?.timer_mode === 'stopwatch';
   const isBand = !isTime && !!ex?.use_band;
+  const isBodyweight = !isTime && !isBand && !!ex?.bodyweight;
   return (
     <Modal open={open} onClose={onClose} title="Add exercise to session"
       footer={<><Button variant="outline" onClick={onClose}>Cancel</Button><Button disabled={!exId} onClick={() => onAdd({ exId, sets, reps, weight, dur })}>Add</Button></>}>
@@ -2007,11 +2242,13 @@ function SessionAddExerciseModal({ open, onClose, onAdd, db }) {
       <div className="grid grid-cols-2 gap-3">
         <div><Label>Sets</Label><Input type="number" min="1" value={sets} onChange={e => setSets(e.target.value)} /></div>
         {isTime
-          ? <div><Label>Duration (sec)</Label><Input type="number" min="1" value={dur} onChange={e => setDur(e.target.value)} /></div>
+          ? (isStopwatch
+              ? <div className="text-xs text-neutral-500 flex items-center">Max-hold stopwatch — no fixed duration</div>
+              : <div><Label>Duration (sec)</Label><Input type="number" min="1" value={dur} onChange={e => setDur(e.target.value)} /></div>)
           : <div><Label>Reps</Label><Input value={reps} onChange={e => setReps(e.target.value)} placeholder="8-10" /></div>
         }
       </div>
-      {!isTime && ex && <>
+      {!isTime && !isBodyweight && ex && <>
         <div className="h-3" />
         <Label>{isBand ? 'Band' : 'Weight'}</Label>
         <Input type="text" inputMode={isBand ? 'text' : 'decimal'} value={weight} onChange={e => setWeight(e.target.value)} placeholder={isBand ? 'e.g. red, heavy' : '60 kg'} />
@@ -2019,6 +2256,7 @@ function SessionAddExerciseModal({ open, onClose, onAdd, db }) {
     </Modal>
   );
 }
+
 
 /* ─── SessionReplaceModal: swap one session exercise for another ─────────── */
 function SessionReplaceModal({ open, seId, onClose, onReplace, db }) {
@@ -2051,6 +2289,11 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   const [rDone, setRDone] = useState(false);
   const lRef = useRef(null); const rRef = useRef(null);
   const pRef = useRef(plannedSec);
+  // Refs that mirror lDone/rDone so setInterval callbacks always read fresh values
+  const lDoneRef = useRef(false);
+  const rDoneRef = useRef(false);
+  useEffect(() => { lDoneRef.current = lDone; }, [lDone]);
+  useEffect(() => { rDoneRef.current = rDone; }, [rDone]);
   useEffect(() => { pRef.current = plannedSec; }, [plannedSec]);
   useEffect(() => { if (!lRun && !lDone) setLRem(plannedSec); }, [plannedSec, lRun, lDone]);
   useEffect(() => { if (!rRun && !rDone) setRRem(plannedSec); }, [plannedSec, rRun, rDone]);
@@ -2060,17 +2303,26 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   }, []);
 
   const markBothDone = () => {
-    updateSet(s.id, { actual_duration_sec: pRef.current, completed: 1 });
+    // Countdown timers always run the full planned duration per side, so record
+    // L/R holds too — otherwise getBestHoldForExercise() never sees bilateral data.
+    updateSet(s.id, {
+      actual_duration_sec: pRef.current,
+      actual_duration_sec_left: pRef.current,
+      actual_duration_sec_right: pRef.current,
+      completed: 1,
+    });
     if (onComplete) setTimeout(onComplete, 60);
   };
 
   const startSide = (side) => {
     const isL = side === 'L';
-    const otherDone = isL ? rDone : lDone;
+    // Use ref (not state) to read otherDone inside the interval — avoids stale closure
+    const otherDoneRef = isL ? rDoneRef : lDoneRef;
     const ref = isL ? lRef : rRef;
     const setRun = isL ? setLRun : setRRun;
     const setRem = isL ? setLRem : setRRem;
     const setDone = isL ? setLDone : setRDone;
+    const doneRef = isL ? lDoneRef : rDoneRef;
     const p = pRef.current;
     setRun(true);
     const t0 = Date.now();
@@ -2078,9 +2330,10 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
       const left = p - Math.floor((Date.now() - t0) / 1000);
       if (left <= 0) {
         clearInterval(ref.current); ref.current = null;
+        doneRef.current = true;
         setRem(0); setRun(false); setDone(true);
         try { playBeep(); } catch (_) {}
-        if (otherDone) markBothDone();
+        if (otherDoneRef.current) markBothDone();
       } else { setRem(left); }
     }, 200);
   };
@@ -2099,7 +2352,12 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
       updateSet(s.id, { completed: 0, actual_duration_sec: null });
       setLDone(false); setRDone(false);
     } else {
-      updateSet(s.id, { completed: 1, actual_duration_sec: pRef.current });
+      updateSet(s.id, {
+        completed: 1,
+        actual_duration_sec: pRef.current,
+        actual_duration_sec_left: pRef.current,
+        actual_duration_sec_right: pRef.current,
+      });
       setLDone(true); setRDone(true);
       if (onComplete) setTimeout(onComplete, 60);
     }
@@ -2126,6 +2384,214 @@ function BilateralTimeSetRow({ s, plannedSec, updateSet, onComplete }) {
   );
 }
 
+
+/* ─── StopwatchSetRow: count-up hold timer, no target — logs actual_duration_sec ─── */
+function StopwatchSetRow({ s, updateSet, onComplete, best }) {
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(s.actual_duration_sec || 0);
+  const tickRef = useRef(null);
+
+  useEffect(() => () => { if (tickRef.current) clearInterval(tickRef.current); }, []);
+
+  const start = () => {
+    setElapsed(0);
+    setRunning(true);
+    const startedAt = Date.now();
+    tickRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 250);
+  };
+
+  const stop = () => {
+    if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
+    setRunning(false);
+    try { playBeep(); } catch (e) {}
+    updateSet(s.id, { actual_duration_sec: elapsed, completed: 1 });
+    if (onComplete) setTimeout(onComplete, 60);
+  };
+
+  const manualToggle = () => {
+    if (s.completed) {
+      updateSet(s.id, { completed: 0 });
+    } else {
+      updateSet(s.id, { completed: 1 });
+      if (onComplete) setTimeout(onComplete, 60);
+    }
+  };
+
+  const isNewBest = s.completed && best && s.actual_duration_sec >= best;
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="w-6 text-xs text-neutral-500">#{s.set_number}</div>
+      <div className="flex-1 text-sm font-mono" data-testid={`text-stopwatch-${s.id}`}>
+        {s.completed ? `${s.actual_duration_sec || 0}s ✓${isNewBest ? ' 🏆' : ''}` : (running ? `${elapsed}s` : `${s.actual_duration_sec || 0}s`)}
+      </div>
+      {!s.completed && !running && <Button size="sm" onClick={start} data-testid={`button-stopwatch-start-${s.id}`}>{I.play} Start</Button>}
+      {running && <Button size="sm" variant="outline" onClick={stop} data-testid={`button-stopwatch-stop-${s.id}`}>Stop</Button>}
+      <button onClick={manualToggle} className={`h-9 w-9 rounded-md flex items-center justify-center ${s.completed ? 'bg-brand text-white' : 'bg-neutral-100 text-neutral-500'}`} data-testid={`button-set-complete-${s.id}`}>{I.check}</button>
+    </div>
+  );
+}
+
+/* ─── BilateralStopwatchSetRow: two independent L/R count-up hold timers ─── */
+function BilateralStopwatchSetRow({ s, updateSet, onComplete, bestLeft, bestRight }) {
+  const [lRun, setLRun] = useState(false);
+  const [rRun, setRRun] = useState(false);
+  const [lElapsed, setLElapsed] = useState(s.actual_duration_sec_left || 0);
+  const [rElapsed, setRElapsed] = useState(s.actual_duration_sec_right || 0);
+  const lRef = useRef(null); const rRef = useRef(null);
+
+  // Synchronous mirrors of each side's SAVED value. The `s` prop only updates on
+  // the next render, so when the user stops the second side we can't rely on
+  // `s.actual_duration_sec_*` to know whether the other side is already done —
+  // it may still be stale. These refs are written the instant a side is stopped,
+  // so "is the other side done?" and the final max() are always correct.
+  const lSavedRef = useRef(s.actual_duration_sec_left != null ? s.actual_duration_sec_left : null);
+  const rSavedRef = useRef(s.actual_duration_sec_right != null ? s.actual_duration_sec_right : null);
+  useEffect(() => { lSavedRef.current = s.actual_duration_sec_left != null ? s.actual_duration_sec_left : lSavedRef.current; }, [s.actual_duration_sec_left]);
+  useEffect(() => { rSavedRef.current = s.actual_duration_sec_right != null ? s.actual_duration_sec_right : rSavedRef.current; }, [s.actual_duration_sec_right]);
+
+  useEffect(() => () => {
+    if (lRef.current) clearInterval(lRef.current);
+    if (rRef.current) clearInterval(rRef.current);
+  }, []);
+
+  const bothDone = () => {
+    const left = lSavedRef.current != null ? lSavedRef.current : lElapsed;
+    const right = rSavedRef.current != null ? rSavedRef.current : rElapsed;
+    updateSet(s.id, { completed: 1, actual_duration_sec: Math.max(left || 0, right || 0) });
+    if (onComplete) setTimeout(onComplete, 60);
+  };
+
+  const startSide = (side) => {
+    const isL = side === 'L';
+    const ref = isL ? lRef : rRef;
+    const setRun = isL ? setLRun : setRRun;
+    const setElapsed = isL ? setLElapsed : setRElapsed;
+    setElapsed(0);
+    setRun(true);
+    const t0 = Date.now();
+    ref.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - t0) / 1000));
+    }, 250);
+  };
+
+  const stopSide = (side) => {
+    const isL = side === 'L';
+    const ref = isL ? lRef : rRef;
+    const setRun = isL ? setLRun : setRRun;
+    const elapsedVal = isL ? lElapsed : rElapsed;
+    if (ref.current) { clearInterval(ref.current); ref.current = null; }
+    setRun(false);
+    try { playBeep(); } catch (_) {}
+    // Record this side's value both in the DB and in the synchronous ref, so the
+    // "other side done?" check below sees an up-to-date picture immediately.
+    if (isL) lSavedRef.current = elapsedVal; else rSavedRef.current = elapsedVal;
+    const patch = isL ? { actual_duration_sec_left: elapsedVal } : { actual_duration_sec_right: elapsedVal };
+    updateSet(s.id, patch);
+    // If the OTHER side already has a saved value, stopping this one completes
+    // the set automatically (per intended behavior). Read from the ref, not the
+    // possibly-stale `s` prop.
+    const otherVal = isL ? rSavedRef.current : lSavedRef.current;
+    if (otherVal != null) {
+      setTimeout(bothDone, 0);
+    }
+  };
+
+  const manualToggle = () => {
+    if (s.completed) {
+      updateSet(s.id, { completed: 0 });
+    } else {
+      updateSet(s.id, { completed: 1 });
+      if (onComplete) setTimeout(onComplete, 60);
+    }
+  };
+
+  const SideStopwatch = ({ side, running, elapsedVal, savedVal, best, otherRunning }) => {
+    const isNewBest = savedVal != null && best && savedVal >= best;
+    return (
+      <div className="flex items-center gap-1.5 flex-1">
+        <span className="text-xs font-bold w-4 shrink-0 text-neutral-400">{side}</span>
+        <span className="text-sm font-mono w-14 shrink-0">
+          {savedVal != null ? `${savedVal}s✓${isNewBest ? ' 🏆' : ''}` : (running ? `${elapsedVal}s` : '0s')}
+        </span>
+        {savedVal == null && !running && <Button size="sm" disabled={otherRunning} onClick={() => startSide(side)}>{I.play}</Button>}
+        {running && <Button size="sm" variant="outline" onClick={() => stopSide(side)}>Stop</Button>}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="w-6 text-xs text-neutral-500 shrink-0">#{s.set_number}</div>
+      <div className="flex-1 flex flex-col gap-1 py-0.5">
+        <SideStopwatch side="L" running={lRun} elapsedVal={lElapsed} savedVal={s.actual_duration_sec_left} best={bestLeft} otherRunning={rRun} />
+        <SideStopwatch side="R" running={rRun} elapsedVal={rElapsed} savedVal={s.actual_duration_sec_right} best={bestRight} otherRunning={lRun} />
+      </div>
+      <button onClick={manualToggle} className={`shrink-0 h-9 w-9 rounded-md flex items-center justify-center ${s.completed ? 'bg-brand text-white' : 'bg-neutral-100 text-neutral-500'}`}>{I.check}</button>
+    </div>
+  );
+}
+
+/* ========================================================================== */
+/* MOTIVATION PAGE — full-screen image tab                                     */
+/* ========================================================================== */
+
+function MotivationPage() {
+  const [imgSrc, setImgSrc] = useState(() => {
+    try { return localStorage.getItem(MOTIV_IMAGE_KEY) || null; } catch (_) { return null; }
+  });
+  const fileRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { alert('Please select an image file.'); return; }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      setImgSrc(dataUrl);
+      try { localStorage.setItem(MOTIV_IMAGE_KEY, dataUrl); } catch (err) {
+        if (err && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED')) {
+          alert('⚠️ Image is too large to store. Try a smaller or more compressed image.');
+          setImgSrc(null);
+        }
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  return (
+    <div className="flex flex-col h-full w-full bg-black">
+      {imgSrc ? (
+        <button
+          className="flex-1 min-h-0 w-full active:opacity-90"
+          onClick={() => fileRef.current && fileRef.current.click()}
+          aria-label="Tap to change image">
+          <img
+            src={imgSrc}
+            alt="Motivation"
+            className="w-full h-full object-contain"
+          />
+        </button>
+      ) : (
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8 text-center">
+          <div className="text-neutral-600">{I.image}</div>
+          <p className="text-neutral-400 text-sm max-w-xs">No image yet. Tap below to pick one from your device.</p>
+          <button
+            onClick={() => fileRef.current && fileRef.current.click()}
+            className="px-5 py-2.5 rounded-xl bg-brand text-white text-sm font-medium hover:bg-brand-dark active:opacity-80">
+            Choose image
+          </button>
+          <p className="text-neutral-600 text-xs">The image is stored locally on this device.</p>
+        </div>
+      )}
+      <input ref={fileRef} type="file" accept="image/*,image/gif" className="hidden" onChange={handleFile} />
+    </div>
+  );
+}
+
 /* ========================================================================== */
 /* HISTORY                                                                       */
 /* ========================================================================== */
@@ -2148,21 +2614,31 @@ function HistoryPage() {
   return (
     <PageShell title="History">
       <div className="p-4">
-        {items.length === 0 && <p className="text-sm text-neutral-500 text-center py-8">No finished sessions yet.</p>}
-        <Card className="divide-y divide-neutral-100">
-          {items.map(({ s, day, count, completedSets, totalSets }) => (
-            <button key={s.id} onClick={() => navigate(`/history/${s.id}`)} className="w-full text-left p-3 flex items-center gap-2">
-              <div className="flex-1 min-w-0">
-                <div className="font-medium truncate">{day?.name || '(deleted day)'}</div>
-                <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</div>
-              </div>
-              <div className="text-xs text-right text-neutral-500">
-                <div>{count} ex</div>
-                <div>{completedSets}/{totalSets} sets</div>
-              </div>
-            </button>
-          ))}
-        </Card>
+        {items.length === 0
+          ? <p className="text-sm text-neutral-500 text-center py-8">No finished sessions yet.</p>
+          : <Card className="divide-y divide-neutral-100">
+              {items.map(({ s, day, count, completedSets, totalSets }) => (
+                <button key={s.id} onClick={() => navigate(`/history/${s.id}`)} className="w-full text-left p-3 flex items-center gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium truncate">{day?.name || '(deleted day)'}</div>
+                    <div className="text-xs text-neutral-500 flex items-center gap-3">
+          <span>{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</span>
+          {s.duration_sec > 0 && (
+            <span className="font-medium text-neutral-600">
+              {(() => { const h = Math.floor(s.duration_sec/3600); const m = Math.floor((s.duration_sec%3600)/60); const sec = s.duration_sec%60; return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`; })()}
+            </span>
+          )}
+        </div>
+                  </div>
+                  <div className="text-xs text-right text-neutral-500">
+                    <div>{count} ex</div>
+                    <div>{completedSets}/{totalSets} sets</div>
+                    {s.duration_sec > 0 && <div className="font-medium text-neutral-600">{(() => { const h = Math.floor(s.duration_sec/3600); const m = Math.floor((s.duration_sec%3600)/60); const sc = s.duration_sec%60; return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')}` : `${m}m ${String(sc).padStart(2,'0')}s`; })()}</div>}
+                  </div>
+                </button>
+              ))}
+            </Card>
+        }
       </div>
     </PageShell>
   );
@@ -2178,7 +2654,14 @@ function HistoryDetailPage({ id }) {
   return (
     <PageShell title={day?.name || 'Session'} back="/history">
       <div className="p-4 space-y-3">
-        <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</div>
+        <div className="text-xs text-neutral-500 flex items-center gap-3">
+          <span>{new Date((s.finished_at || s.started_at) * 1000).toLocaleString()}</span>
+          {s.duration_sec > 0 && (
+            <span className="font-medium text-neutral-600">
+              {(() => { const h = Math.floor(s.duration_sec/3600); const m = Math.floor((s.duration_sec%3600)/60); const sec = s.duration_sec%60; return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`; })()}
+            </span>
+          )}
+        </div>
         {ses.map(se => {
           const ex = db.exercises.find(e => e.id === se.exercise_id);
           const sets = db.session_sets.filter(x => x.session_exercise_id === se.id).slice().sort((a, b) => a.set_number - b.set_number);
@@ -2218,6 +2701,7 @@ function CalendarPage() {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth()); // 0-11
+  const [multiDaySessions, setMultiDaySessions] = useState(null); // list of sessions for multi-session day
 
   const sessionsByDate = useMemo(() => {
     const m = new Map();
@@ -2258,7 +2742,10 @@ function CalendarPage() {
             const isToday = year === today.getFullYear() && month === today.getMonth() && c === today.getDate();
             return (
               <button key={i} className={`aspect-square rounded-lg border text-xs flex flex-col items-center justify-center p-0.5 ${isToday ? 'border-brand' : 'border-neutral-200'} ${list.length ? 'bg-brand/10' : 'bg-white'}`}
-                onClick={() => list.length === 1 ? navigate(`/history/${list[0].id}`) : null}>
+                onClick={() => {
+                  if (list.length === 1) { navigate(`/history/${list[0].id}`); }
+                  else if (list.length > 1) { setMultiDaySessions(list); }
+                }}>
                 <div className="font-medium">{c}</div>
                 {list.length > 0 && <div className="text-[10px] text-brand">{list.length}</div>}
               </button>
@@ -2267,6 +2754,24 @@ function CalendarPage() {
         </div>
         <p className="text-xs text-neutral-500 mt-3">Tap a day to view its session.</p>
       </div>
+      {/* Multi-session picker modal */}
+      {multiDaySessions && (
+        <Modal open={true} onClose={() => setMultiDaySessions(null)} title="Sessions that day">
+          <div className="space-y-2">
+            {multiDaySessions.map(s => {
+              const day = db.workout_days.find(d => d.id === s.day_id);
+              return (
+                <button key={s.id}
+                  className="w-full text-left p-3 rounded-lg border border-neutral-200 hover:bg-neutral-50 active:bg-neutral-100"
+                  onClick={() => { setMultiDaySessions(null); navigate(`/history/${s.id}`); }}>
+                  <div className="font-medium text-sm">{day?.name || '(deleted day)'}</div>
+                  <div className="text-xs text-neutral-500">{new Date((s.finished_at || s.started_at) * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}</div>
+                </button>
+              );
+            })}
+          </div>
+        </Modal>
+      )}
     </PageShell>
   );
 }
@@ -2275,10 +2780,6 @@ function CalendarPage() {
 /* SETTINGS — Import / Export / Wipe                                          */
 /* ========================================================================== */
 
-const SYNCURL = 'https://script.google.com/macros/s/AKfycbzxYGcApH9VSrFhMVlDFekZSp9A-vKUu39MrABHjgKfnpJ6PYgFEhPlEsM0uYNqoh1xEg/exec';
-const SHEETURL = 'https://docs.google.com/spreadsheets/d/15XSn9GyAVI2Xi6ujuWtUXvcSpUi4_xOfQElDw0QQG7U/edit?gid=0#gid=0';
-const PENDINGSYNCKEY = 'liftlog.syncpending';
-const SYNCDEBUGKEY = 'liftlog.syncdebug';
 
 // ── backgroundSync ────────────────────────────────────────────────────────────
 // Standalone async fn — no React state deps.
@@ -2366,6 +2867,11 @@ async function backgroundSync(db, opts) {
         exercise_name: ex.name || '',
         description: ex.description || '',
         group: group ? (group.name || '') : '',
+        kind: ex.kind || 'reps',
+        timer_mode: ex.timer_mode || '',
+        use_band: ex.use_band ? 1 : 0,
+        bodyweight: ex.bodyweight ? 1 : 0,
+        bilateral: ex.bilateral ? 1 : 0,
       };
     } else {
       if (!exerciseGroupMap[key].description && ex.description) {
@@ -2384,6 +2890,11 @@ async function backgroundSync(db, opts) {
         exercise_name: ex.name || '',
         description: ex.description || '',
         group: '',
+        kind: ex.kind || 'reps',
+        timer_mode: ex.timer_mode || '',
+        use_band: ex.use_band ? 1 : 0,
+        bodyweight: ex.bodyweight ? 1 : 0,
+        bilateral: ex.bilateral ? 1 : 0,
       };
     }
   });
@@ -2473,7 +2984,7 @@ async function backgroundSync(db, opts) {
   };
 
   var columns = {
-    Exercises: ['exercise_name', 'description', 'group'],
+    Exercises: ['exercise_name', 'description', 'group', 'kind', 'timer_mode', 'use_band', 'bodyweight', 'bilateral'],
     Groups: ['group_name', 'sort_order'],
     WorkoutDays: ['day_name', 'group_name', 'sort_order'],
     DayExercises: [
@@ -2610,6 +3121,21 @@ async function pullFromSheets(db, opts) {
     var workoutDaysRows  = tables.WorkoutDays || [];
     var dayExercisesRows = tables.DayExercises || [];
 
+    // Safety guard: a pull REPLACES local plans (groups / days / day_exercises)
+    // with whatever the sheet returns. If the response comes back completely
+    // empty — e.g. a transient backend error, the wrong deployment URL, or a
+    // freshly-cleared spreadsheet — replacing would silently wipe every plan on
+    // this device. Abort instead so nothing is destroyed. (Workout history is
+    // never touched by pull, but plans would be, so we protect them here.)
+    var pulledAnything =
+      (exercisesRows && exercisesRows.length) ||
+      (groupsRows && groupsRows.length) ||
+      (workoutDaysRows && workoutDaysRows.length) ||
+      (dayExercisesRows && dayExercisesRows.length);
+    if (!pulledAnything) {
+      throw new Error('Pull returned no plan data — nothing changed (your plans are safe). Check the sheet and try again.');
+    }
+
     var nextDb = structuredClone(db);
 
     nextDb.exercises = nextDb.exercises || [];
@@ -2630,9 +3156,16 @@ async function pullFromSheets(db, opts) {
       var key = norm(name);
       var ex = exByName[key];
       if (!ex) {
+        // Defaults; the logging-type columns below overwrite these when present.
         ex = {
           id: (typeof uuid === 'function') ? uuid() : Math.random().toString(36).slice(2),
           name: name,
+          kind: 'reps',
+          use_band: false,
+          bodyweight: false,
+          bilateral: false,
+          persistent_notes: '',
+          youtube_url: '',
           description: '',
           archived: 0,
           created_at: Math.floor(Date.now() / 1000),
@@ -2642,6 +3175,26 @@ async function pullFromSheets(db, opts) {
       }
       if (row.description != null && String(row.description).trim()) {
         ex.description = String(row.description);
+      }
+      // Logging-type columns now travel through the sheet, so a plan authored on
+      // the computer (weight/band/bodyweight/timer/stopwatch, bilateral) is
+      // faithfully restored on the phone after a pull. Only apply a column when
+      // the sheet actually provides it, so an older sheet without these columns
+      // can't blank out a locally-set type.
+      if (row.kind != null && String(row.kind).trim()) {
+        ex.kind = String(row.kind).trim();
+      }
+      if (row.timer_mode != null && String(row.timer_mode).trim()) {
+        ex.timer_mode = String(row.timer_mode).trim();
+      }
+      if (row.use_band != null && String(row.use_band) !== '') {
+        ex.use_band = String(row.use_band) === '1' || String(row.use_band).toLowerCase() === 'true';
+      }
+      if (row.bodyweight != null && String(row.bodyweight) !== '') {
+        ex.bodyweight = String(row.bodyweight) === '1' || String(row.bodyweight).toLowerCase() === 'true';
+      }
+      if (row.bilateral != null && String(row.bilateral) !== '') {
+        ex.bilateral = String(row.bilateral) === '1' || String(row.bilateral).toLowerCase() === 'true';
       }
       ex.archived = 0;
     });
@@ -2744,8 +3297,8 @@ async function pullFromSheets(db, opts) {
           exercise_id: ex.id,
           position: row.position !== '' && row.position != null ? Number(row.position) : (newDayExercises.length + 1),
           planned_sets: row.planned_sets !== '' && row.planned_sets != null ? Number(row.planned_sets) : null,
-          planned_reps: row.planned_reps != null ? String(row.planned_reps) : '',
-          planned_weight: row.planned_weight != null ? String(row.planned_weight) : '',
+          planned_reps: row.planned_reps != null && String(row.planned_reps) !== '' ? String(row.planned_reps) : null,
+          planned_weight: row.planned_weight != null && String(row.planned_weight) !== '' ? String(row.planned_weight) : null,
           planned_duration_sec: row.planned_duration_sec !== '' && row.planned_duration_sec != null ? Number(row.planned_duration_sec) : null,
           notes: row.notes != null ? String(row.notes) : '',
           warmup: String(row.warmup || '') === '1' || String(row.warmup || '').toLowerCase() === 'true',
@@ -2814,11 +3367,11 @@ function SettingsPage() {
   const [pulling, setPulling] = useState(false);
   const [syncStatus, setSyncStatus] = useState('idle');
   const [lastSync, setLastSync] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastsync') || null; }
+    try { return localStorage.getItem('liftlog.last_sync') || null; }
     catch (e) { return null; }
   });
   const [lastPull, setLastPull] = useState(() => {
-    try { return localStorage.getItem('liftlog.lastpull') || null; }
+    try { return localStorage.getItem('liftlog.last_pull') || null; }
     catch (e) { return null; }
   });
   const [pendingSync, setPendingSync] = useState(() => {
@@ -2900,6 +3453,7 @@ function SettingsPage() {
   return (
     <PageShell title="Settings">
       <div className="p-4 space-y-3">
+
         <Card className="p-4">
           <div className="flex items-center justify-between mb-1">
             <h3 className="font-semibold">☁️ Google Sheets Backup</h3>
@@ -2943,7 +3497,8 @@ function AppRouter() {
   const { path } = useHashRoute();
   const seg = path.split('/').filter(Boolean);
 
-  if (seg.length === 0) return <HomePage />;
+  if (path === '/')           return <HomePage />;
+  if (seg[0] === 'motivation') return <MotivationPage />;
   if (seg[0] === 'groups') return <GroupsPage />;
   if (seg[0] === 'exercises') return <ExercisesPage />;
   if (seg[0] === 'day' && seg[1]) return <DayEditorPage id={seg[1]} />;
@@ -2956,6 +3511,7 @@ function AppRouter() {
 }
 
 function App() {
+  useLaunchRedirect();
   return (
     <AppProvider>
       <div className="flex flex-col h-full w-full">
