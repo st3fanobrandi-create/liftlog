@@ -586,14 +586,24 @@ function GroupsPage() {
   };
 
   const del = async (g) => {
-    const ok = await confirm({ title: 'Delete group?', message: `Days in "${g.name}" will become ungrouped. The days themselves are not deleted.`, danger: true, confirmLabel: 'Delete' });
+    const daysInGroup = db.workout_days.filter(day => day.group_id === g.id);
+    const ok = await confirm({
+      title: 'Delete group?',
+      message: daysInGroup.length > 0
+        ? `"${g.name}" and its ${daysInGroup.length} day${daysInGroup.length !== 1 ? 's' : ''} (${daysInGroup.map(d => d.name).join(', ')}) will be deleted. Exercises, notes, and workout history are kept.`
+        : `Delete "${g.name}"? It has no days in it.`,
+      danger: true, confirmLabel: 'Delete',
+    });
     if (!ok) return;
     mutate(d => {
+      const dayIdsToDelete = new Set(d.workout_days.filter(day => day.group_id === g.id).map(day => day.id));
       d.groups = d.groups.filter(x => x.id !== g.id);
-      d.workout_days.forEach(day => { if (day.group_id === g.id) day.group_id = null; });
+      d.workout_days = d.workout_days.filter(day => !dayIdsToDelete.has(day.id));
+      d.day_exercises = d.day_exercises.filter(de => !dayIdsToDelete.has(de.day_id));
+      d.supersets = d.supersets.filter(s => !dayIdsToDelete.has(s.day_id));
       return d;
     });
-    showToast('Group deleted');
+    showToast('Group and its days deleted');
   };
 
   return (
