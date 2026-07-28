@@ -790,6 +790,8 @@ function parseBulkExercises(text) {
     const rawSides = String(fields.sides || '').toLowerCase();
     const sideValues = { lr: true, 'l/r': true, 'left/right': true, single: false, none: false };
 
+    const rawSuperset = String(fields.superset || '').trim();
+
     current.items.push({
       name: parts[0],
       fields,
@@ -797,6 +799,7 @@ function parseBulkExercises(text) {
       hasType: hasOwn(fields, 'type'),
       bilateral: hasOwn(sideValues, rawSides) ? sideValues[rawSides] : null,
       hasSides: hasOwn(fields, 'sides') && hasOwn(sideValues, rawSides),
+      supersetKey: rawSuperset || null,
     });
   }
   pushCurrentIfValid();
@@ -855,6 +858,11 @@ function applyBulkExercises(d, parsedBlocks) {
     d.day_exercises = d.day_exercises.filter(de => de.day_id !== day.id);
     d.supersets = d.supersets.filter(ss => ss.day_id !== day.id);
 
+    // Map each distinct supersetKey (e.g. "A", "B") used within this day to a
+    // freshly created superset row, in first-seen order.
+    const supersetIdByKey = new Map();
+    let supersetSortCounter = 0;
+
     items.forEach((item, idx) => {
       const key = norm(item.name);
       if (!key) return;
@@ -882,6 +890,24 @@ function applyBulkExercises(d, parsedBlocks) {
       }
 
       const isTimer = (item.type || loggingTypeOf(ex)) === 'timer';
+
+      // Resolve (or lazily create) the superset row for this item's key,
+      // scoped to the current day only. Items without a supersetKey are
+      // left standalone (superset_id stays null).
+      let supersetId = null;
+      if (item.supersetKey) {
+        if (!supersetIdByKey.has(item.supersetKey)) {
+          const ssId = uuid();
+          supersetSortCounter += 1;
+          d.supersets.push({
+            id: ssId, day_id: day.id, label: `Superset ${item.supersetKey}`,
+            position: supersetSortCounter, created_at: nowSec(),
+          });
+          supersetIdByKey.set(item.supersetKey, ssId);
+        }
+        supersetId = supersetIdByKey.get(item.supersetKey);
+      }
+
       d.day_exercises.push({
         id: uuid(), day_id: day.id, exercise_id: ex.id, position: idx + 1,
         planned_sets: parseSets(f.sets),
@@ -891,7 +917,7 @@ function applyBulkExercises(d, parsedBlocks) {
         notes: Object.prototype.hasOwnProperty.call(f, 'notes') ? (f.notes || null) : null,
         warmup: parseBool(f.warmup) ? 1 : 0,
         main: parseBool(f.main) ? 1 : 0,
-        superset_id: null,
+        superset_id: supersetId,
         rest_hint: Object.prototype.hasOwnProperty.call(f, 'rest') ? (f.rest || null) : null,
         band_hint: Object.prototype.hasOwnProperty.call(f, 'band') ? (f.band || null) : null,
       });
@@ -909,9 +935,9 @@ function BulkExerciseImportModal({ open, onClose }) {
     'DAY: Small Day D',
     'GROUP: Shoulder Rehab',
     'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | sides=single | rest=30s | notes=easy warmup | description=Gentle thoracic mobility | main=false | warmup=true',
-    'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
-    'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
-    'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
+    'EXERCISE: Band Face Pull | superset=A | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
+    'EXERCISE: Standing Scap Retractions | superset=A | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
+    'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | superset=A | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
     'EXERCISE: Front Plank Hold | sets=3 | type=stopwatch | rest=60s | notes=brace core | main=true | warmup=false',
     'EXERCISE: Dead Bug Hold | sets=3 | reps=1 | type=timer | duration=20 | sides=lr | rest=30s | notes=keep low back flat | main=false | warmup=false',
     '',
@@ -955,7 +981,7 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Each imported DAY replaces that day’s plan exactly; past workout history is never changed. Supports type=weight|band|bodyweight|timer|stopwatch; sides=single|lr; duration (seconds, timer only); weight; band; rest; notes (day-specific); description; persistent_notes; youtube_url; main; warmup.</p>
+        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Each imported DAY replaces that day’s plan exactly; past workout history is never changed. Supports type=weight|band|bodyweight|timer|stopwatch; sides=single|lr; duration (seconds, timer only); weight; band; rest; notes (day-specific); description; persistent_notes; youtube_url; main; warmup; superset=A|B|... (exercises sharing the same letter within a DAY are grouped together, both in the day plan and during the workout).</p>
         <textarea
           rows={12}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
@@ -1786,6 +1812,27 @@ function SessionPage({ id }) {
     showToast('Exercise replaced');
   };
 
+  // Group consecutive session exercises that share the same superset_key so
+  // they can be visually boxed together during the workout. Exercises with
+  // no superset_key (the common case) render exactly as before, standalone.
+  const sessionItems = [];
+  {
+    let i = 0;
+    while (i < ses.length) {
+      const se = ses[i];
+      if (se.superset_key) {
+        const key = se.superset_key;
+        const label = se.superset_label;
+        const group = [];
+        while (i < ses.length && ses[i].superset_key === key) { group.push(ses[i]); i++; }
+        sessionItems.push({ kind: 'ss', key, label, group });
+      } else {
+        sessionItems.push({ kind: 'se', se });
+        i++;
+      }
+    }
+  }
+
   return (
     <PageShell title={day?.name || 'Session'} back={null}
       right={<div className="flex items-center gap-2">
@@ -1793,7 +1840,21 @@ function SessionPage({ id }) {
         <button onClick={cancel} className="p-2 text-red-600" aria-label="Cancel">{I.x}</button>
       </div>}>
       <div className="p-4 space-y-3 pb-36">
-        {ses.map(se => <SessionExercise key={se.id} se={se} onReplace={() => setReplaceSeId(se.id)} />)}
+        {sessionItems.map((item, i) => {
+          if (item.kind === 'se') {
+            return <SessionExercise key={item.se.id} se={item.se} onReplace={() => setReplaceSeId(item.se.id)} />;
+          }
+          return (
+            <div key={`ss-${item.key}-${i}`} className="rounded-2xl border-2 border-brand/40 bg-brand/5 p-2 space-y-2">
+              <div className="flex items-center gap-1 px-1 text-brand text-xs font-semibold uppercase tracking-wide">
+                {I.layers} {item.label || `Superset ${item.key}`}
+              </div>
+              <div className="space-y-2">
+                {item.group.map(se => <SessionExercise key={se.id} se={se} onReplace={() => setReplaceSeId(se.id)} />)}
+              </div>
+            </div>
+          );
+        })}
         <button onClick={() => setShowAddEx(true)}
           className="w-full flex items-center justify-center gap-2 py-3 rounded-xl border-2 border-dashed border-neutral-300 text-neutral-500 hover:border-brand hover:text-brand active:bg-brand/5 transition-colors text-sm font-medium">
           {I.plus} Add exercise
@@ -1947,7 +2008,6 @@ function SessionExercise({ se, onReplace }) {
   return (
     <Card className={`p-3 ${se.completed ? 'opacity-70' : ''}`}>
       <div className="flex items-start gap-2 mb-2">
-        {se.superset_label && <Badge className="bg-brand/15 text-brand font-medium shrink-0">{I.layers} {se.superset_label}</Badge>}
         <div className="flex-1 min-w-0">
           <div className="font-medium leading-snug">{ex.name}</div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
