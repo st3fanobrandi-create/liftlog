@@ -586,24 +586,14 @@ function GroupsPage() {
   };
 
   const del = async (g) => {
-    const daysInGroup = db.workout_days.filter(day => day.group_id === g.id);
-    const ok = await confirm({
-      title: 'Delete group?',
-      message: daysInGroup.length > 0
-        ? `"${g.name}" and its ${daysInGroup.length} day${daysInGroup.length !== 1 ? 's' : ''} (${daysInGroup.map(d => d.name).join(', ')}) will be deleted. Exercises, notes, and workout history are kept.`
-        : `Delete "${g.name}"? It has no days in it.`,
-      danger: true, confirmLabel: 'Delete',
-    });
+    const ok = await confirm({ title: 'Delete group?', message: `Days in "${g.name}" will become ungrouped. The days themselves are not deleted.`, danger: true, confirmLabel: 'Delete' });
     if (!ok) return;
     mutate(d => {
-      const dayIdsToDelete = new Set(d.workout_days.filter(day => day.group_id === g.id).map(day => day.id));
       d.groups = d.groups.filter(x => x.id !== g.id);
-      d.workout_days = d.workout_days.filter(day => !dayIdsToDelete.has(day.id));
-      d.day_exercises = d.day_exercises.filter(de => !dayIdsToDelete.has(de.day_id));
-      d.supersets = d.supersets.filter(s => !dayIdsToDelete.has(s.day_id));
+      d.workout_days.forEach(day => { if (day.group_id === g.id) day.group_id = null; });
       return d;
     });
-    showToast('Group and its days deleted');
+    showToast('Group deleted');
   };
 
   return (
@@ -755,13 +745,17 @@ function parseBulkExercises(text) {
   let current = null;
 
   function ensureCurrent() {
-    if (!current) current = { dayName: '', groupName: '', items: [] };
+    if (!current) {
+      current = { dayName: '', groupName: '', items: [] };
+    }
   }
+
   function pushCurrentIfValid() {
-    if (current && current.dayName && current.groupName && current.items.length) blocks.push(current);
+    if (current && current.dayName && current.groupName && current.items.length) {
+      blocks.push(current);
+    }
     current = null;
   }
-  function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
 
   for (const line of lines) {
     if (line.toUpperCase().startsWith('DAY:')) {
@@ -769,163 +763,232 @@ function parseBulkExercises(text) {
       current = { dayName: line.slice(4).trim(), groupName: '', items: [] };
       continue;
     }
+
     ensureCurrent();
+
     if (line.toUpperCase().startsWith('GROUP:')) {
       current.groupName = line.slice(6).trim();
       continue;
     }
-    if (!line.toUpperCase().startsWith('EXERCISE:')) continue;
 
-    const parts = line.slice('EXERCISE:'.length).trim().split('|').map(p => p.trim()).filter(Boolean);
-    if (!parts.length) continue;
-    const fields = {};
-    for (let i = 1; i < parts.length; i++) {
-      const eq = parts[i].indexOf('=');
-      if (eq < 0) continue;
-      fields[parts[i].slice(0, eq).trim().toLowerCase()] = parts[i].slice(eq + 1).trim();
+    if (line.toUpperCase().startsWith('EXERCISE:')) {
+      const rest = line.slice('EXERCISE:'.length).trim();
+      const parts = rest.split('|').map(p => p.trim()).filter(Boolean);
+      if (!parts.length) continue;
+
+      const name = parts[0];
+      const fields = {};
+      for (let i = 1; i < parts.length; i++) {
+        const eq = parts[i].indexOf('=');
+        const rawK = eq >= 0 ? parts[i].slice(0, eq) : parts[i];
+        const rawV = eq >= 0 ? parts[i].slice(eq + 1) : '';
+        const k = rawK.trim().toLowerCase();
+        const v = rawV.trim();
+        fields[k] = v;
+      }
+
+      // Normalize logging type. Accepts: weight | band | bodyweight | timer | stopwatch
+      const rawType = (fields['type'] || '').trim().toLowerCase();
+      const validTypes = ['weight', 'band', 'bodyweight', 'timer', 'stopwatch'];
+      const type = validTypes.includes(rawType) ? rawType : '';
+
+      // Normalize sides. Accepts: lr, l/r, left/right (case-insensitive) -> bilateral true
+      const rawSides = (fields['sides'] || '').trim().toLowerCase();
+      const bilateral = ['lr', 'l/r', 'left/right'].includes(rawSides);
+
+      current.items.push({
+        name,
+        sets: fields['sets'] || '',
+        reps: fields['reps'] || '',
+        rest: fields['rest'] || '',
+        band: fields['band'] || '',
+        notes: fields['notes'] || '',
+        main: parseBool(fields['main']),
+        warmup: parseBool(fields['warmup']),
+        type,
+        duration: fields['duration'] || '',
+        sides: bilateral,
+        weight: fields['weight'] || '',
+      });
     }
-
-    const rawType = String(fields.type || '').toLowerCase();
-    const validTypes = ['weight', 'band', 'bodyweight', 'timer', 'stopwatch'];
-    const rawSides = String(fields.sides || '').toLowerCase();
-    const sideValues = { lr: true, 'l/r': true, 'left/right': true, single: false, none: false };
-
-    const rawSuperset = String(fields.superset || '').trim();
-
-    current.items.push({
-      name: parts[0],
-      fields,
-      type: validTypes.includes(rawType) ? rawType : '',
-      hasType: hasOwn(fields, 'type'),
-      bilateral: hasOwn(sideValues, rawSides) ? sideValues[rawSides] : null,
-      hasSides: hasOwn(fields, 'sides') && hasOwn(sideValues, rawSides),
-      supersetKey: rawSuperset || null,
-    });
   }
+
   pushCurrentIfValid();
   return blocks;
 }
 
 function applyBulkExercises(d, parsedBlocks) {
   if (!Array.isArray(parsedBlocks) || !parsedBlocks.length) return d;
+
   d.groups = d.groups || [];
   d.workout_days = d.workout_days || [];
   d.exercises = d.exercises || [];
   d.day_exercises = d.day_exercises || [];
-  d.supersets = d.supersets || [];
 
-  const norm = v => String(v || '').trim().toLowerCase();
-  const maxSort = rows => rows.reduce((m, r) => Math.max(m, r.sort_order || 0), 0);
-  const parseSets = value => {
-    const n = parseInt(String(value || '').split('-')[0], 10);
-    return Number.isFinite(n) && n > 0 ? n : 1;
-  };
-  const parseDuration = value => {
-    const n = parseInt(String(value || '').split('-')[0], 10);
-    return Number.isFinite(n) && n >= 0 ? n : null;
-  };
+  function norm(v) {
+    return String(v || '').trim().toLowerCase();
+  }
+
+  function maxSort(rows) {
+    return rows.reduce((m, r) => Math.max(m, r.sort_order || 0), 0);
+  }
+
   const exByName = new Map();
   d.exercises.forEach(ex => exByName.set(norm(ex.name), ex));
 
-  function deriveExerciseFields(type) {
-    if (type === 'band') return { kind: 'reps', use_band: true, bodyweight: false, timer_mode: null };
-    if (type === 'bodyweight') return { kind: 'reps', use_band: false, bodyweight: true, timer_mode: null };
-    if (type === 'timer') return { kind: 'time', use_band: false, bodyweight: false, timer_mode: 'countdown' };
-    if (type === 'stopwatch') return { kind: 'time', use_band: false, bodyweight: false, timer_mode: 'stopwatch' };
-    return { kind: 'reps', use_band: false, bodyweight: false, timer_mode: null };
+  // Derive the exercise-level fields (kind/use_band/bodyweight/timer_mode/bilateral)
+  // from the parsed type + sides for a given bulk item.
+  function deriveExerciseFields(item) {
+    const out = { kind: 'reps', use_band: false, bodyweight: false, timer_mode: null };
+    switch (item.type) {
+      case 'band':
+        out.kind = 'reps';
+        out.use_band = true;
+        break;
+      case 'bodyweight':
+        out.kind = 'reps';
+        out.bodyweight = true;
+        break;
+      case 'timer':
+        out.kind = 'time';
+        out.timer_mode = 'countdown';
+        break;
+      case 'stopwatch':
+        out.kind = 'time';
+        out.timer_mode = 'stopwatch';
+        break;
+      case 'weight':
+      default:
+        out.kind = 'reps';
+        break;
+    }
+    return out;
   }
 
   parsedBlocks.forEach(block => {
     const dayName = String(block.dayName || '').trim();
     const groupName = String(block.groupName || '').trim();
     const items = Array.isArray(block.items) ? block.items : [];
+
     if (!dayName || !groupName || !items.length) return;
 
     let group = d.groups.find(g => norm(g.name) === norm(groupName));
     if (!group) {
-      group = { id: uuid(), name: groupName, sort_order: maxSort(d.groups) + 1, created_at: nowSec() };
+      group = {
+        id: uuid(),
+        name: groupName,
+        sort_order: maxSort(d.groups) + 1,
+        created_at: nowSec(),
+      };
       d.groups.push(group);
     }
+
     let day = d.workout_days.find(w => norm(w.name) === norm(dayName) && (w.group_id || null) === group.id);
     if (!day) {
-      const sort = d.workout_days.filter(w => (w.group_id || null) === group.id).reduce((m, w) => Math.max(m, w.sort_order || 0), 0);
-      day = { id: uuid(), name: dayName, group_id: group.id, sort_order: sort + 1, created_at: nowSec() };
+      const maxDaySortInGroup = d.workout_days
+        .filter(w => (w.group_id || null) === group.id)
+        .reduce((m, w) => Math.max(m, w.sort_order || 0), 0);
+
+      day = {
+        id: uuid(),
+        name: dayName,
+        group_id: group.id,
+        sort_order: maxDaySortInGroup + 1,
+        created_at: nowSec(),
+      };
       d.workout_days.push(day);
     }
 
-    // A complete PT import is authoritative for each included day: remove only
-    // that day's old plan rows, never exercises or historical session data.
-    d.day_exercises = d.day_exercises.filter(de => de.day_id !== day.id);
-    d.supersets = d.supersets.filter(ss => ss.day_id !== day.id);
-
-    // Map each distinct supersetKey (e.g. "A", "B") used within this day to a
-    // freshly created superset row, in first-seen order.
-    const supersetIdByKey = new Map();
-    let supersetSortCounter = 0;
+    const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
 
     items.forEach((item, idx) => {
       const key = norm(item.name);
       if (!key) return;
-      const f = item.fields || {};
+
+      const derived = deriveExerciseFields(item);
+
       let ex = exByName.get(key);
       if (!ex) {
-        const type = item.type || 'weight';
-        const derived = deriveExerciseFields(type);
         ex = {
-          id: uuid(), name: item.name, ...derived,
-          bilateral: item.hasSides ? item.bilateral : false,
-          description: f.description || '', persistent_notes: f.persistent_notes || '',
-          youtube_url: f.youtube_url || '', archived: 0, created_at: nowSec(),
+          id: uuid(),
+          name: item.name,
+          kind: derived.kind,
+          use_band: derived.use_band,
+          bodyweight: derived.bodyweight,
+          timer_mode: derived.timer_mode,
+          bilateral: item.sides,
+          description: item.notes || '',
+          persistent_notes: item.notes || '',
+          youtube_url: '',
+          archived: 0,
+          created_at: nowSec(),
         };
         d.exercises.push(ex);
         exByName.set(key, ex);
       } else {
-        // Exercise-wide fields change only when explicitly supplied.
-        if (item.hasType) Object.assign(ex, deriveExerciseFields(item.type || 'weight'));
-        if (item.hasSides) ex.bilateral = item.bilateral;
-        if (Object.prototype.hasOwnProperty.call(f, 'description')) ex.description = f.description;
-        if (Object.prototype.hasOwnProperty.call(f, 'persistent_notes')) ex.persistent_notes = f.persistent_notes;
-        if (Object.prototype.hasOwnProperty.call(f, 'youtube_url')) ex.youtube_url = f.youtube_url;
-        ex.archived = 0;
-      }
-
-      const isTimer = (item.type || loggingTypeOf(ex)) === 'timer';
-
-      // Resolve (or lazily create) the superset row for this item's key,
-      // scoped to the current day only. Items without a supersetKey are
-      // left standalone (superset_id stays null).
-      let supersetId = null;
-      if (item.supersetKey) {
-        if (!supersetIdByKey.has(item.supersetKey)) {
-          const ssId = uuid();
-          supersetSortCounter += 1;
-          d.supersets.push({
-            id: ssId, day_id: day.id, label: `Superset ${item.supersetKey}`,
-            position: supersetSortCounter, created_at: nowSec(),
-          });
-          supersetIdByKey.set(item.supersetKey, ssId);
+        // Update type/sides on re-import so existing exercises stay in sync
+        // with the latest plan coming from the PT thread.
+        if (item.type) {
+          ex.kind = derived.kind;
+          ex.use_band = derived.use_band;
+          ex.bodyweight = derived.bodyweight;
+          ex.timer_mode = derived.timer_mode;
         }
-        supersetId = supersetIdByKey.get(item.supersetKey);
+        if (item.sides) ex.bilateral = true;
+        if (item.notes) ex.description = item.notes;
+        if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
       }
 
-      d.day_exercises.push({
-        id: uuid(), day_id: day.id, exercise_id: ex.id, position: idx + 1,
-        planned_sets: parseSets(f.sets),
-        planned_reps: Object.prototype.hasOwnProperty.call(f, 'reps') ? (f.reps || null) : null,
-        planned_weight: Object.prototype.hasOwnProperty.call(f, 'weight') ? (f.weight || null) : null,
-        planned_duration_sec: isTimer && Object.prototype.hasOwnProperty.call(f, 'duration') ? parseDuration(f.duration) : null,
-        notes: Object.prototype.hasOwnProperty.call(f, 'notes') ? (f.notes || null) : null,
-        warmup: parseBool(f.warmup) ? 1 : 0,
-        main: parseBool(f.main) ? 1 : 0,
-        superset_id: supersetId,
-        rest_hint: Object.prototype.hasOwnProperty.call(f, 'rest') ? (f.rest || null) : null,
-        band_hint: Object.prototype.hasOwnProperty.call(f, 'band') ? (f.band || null) : null,
-      });
+      let de = dayExForDay.find(x => x.exercise_id === ex.id);
+      if (!de) {
+        de = {
+          id: uuid(),
+          day_id: day.id,
+          exercise_id: ex.id,
+          position: dayExForDay.reduce((m, x) => Math.max(m, x.position || 0), 0) + 1 + idx,
+          planned_sets: 1,
+          planned_reps: null,
+          planned_weight: null,
+          planned_duration_sec: null,
+          notes: '',
+          warmup: 0,
+          main: 0,
+          superset_id: null,
+          rest_hint: null,
+          band_hint: null,
+        };
+        d.day_exercises.push(de);
+        dayExForDay.push(de);
+      }
+
+      if (item.sets) {
+        const first = parseInt(String(item.sets).split('-')[0], 10);
+        if (!isNaN(first)) de.planned_sets = first;
+      }
+      if (item.reps) de.planned_reps = item.reps;
+      if (item.band) {
+        de.band_hint = item.band;
+      }
+      // Explicit starting weight always takes priority; fall back to band label
+      // only when no numeric/text weight was given.
+      if (item.weight) {
+        de.planned_weight = item.weight;
+      } else if (item.band && !de.planned_weight) {
+        de.planned_weight = item.band;
+      }
+      if (item.type === 'timer' && item.duration) {
+        const durNum = parseInt(String(item.duration).split('-')[0], 10);
+        if (!isNaN(durNum)) de.planned_duration_sec = durNum;
+      }
+      if (item.rest) de.rest_hint = item.rest;
+      if (item.notes) de.notes = item.notes;
+      de.main = item.main ? 1 : 0;
+      de.warmup = item.warmup ? 1 : 0;
     });
   });
+
   return d;
 }
-
 
 function BulkExerciseImportModal({ open, onClose }) {
   const { mutate, showToast } = useApp();
@@ -934,10 +997,10 @@ function BulkExerciseImportModal({ open, onClose }) {
   const example = [
     'DAY: Small Day D',
     'GROUP: Shoulder Rehab',
-    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | sides=single | rest=30s | notes=easy warmup | description=Gentle thoracic mobility | main=false | warmup=true',
-    'EXERCISE: Band Face Pull | superset=A | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
-    'EXERCISE: Standing Scap Retractions | superset=A | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
-    'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | superset=A | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
+    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | rest=30s | notes=easy warmup | main=false | warmup=true',
+    'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
+    'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
+    'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
     'EXERCISE: Front Plank Hold | sets=3 | type=stopwatch | rest=60s | notes=brace core | main=true | warmup=false',
     'EXERCISE: Dead Bug Hold | sets=3 | reps=1 | type=timer | duration=20 | sides=lr | rest=30s | notes=keep low back flat | main=false | warmup=false',
     '',
@@ -969,7 +1032,7 @@ function BulkExerciseImportModal({ open, onClose }) {
     setBusy(true);
     try {
       mutate(d => applyBulkExercises(d, parsed));
-      showToast('Bulk import replaced the included day plan(s)');
+      showToast('Bulk import merged into plan');
       onClose();
     } catch (e) {
       showToast('Import failed: ' + (e.message || e));
@@ -981,7 +1044,7 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Each imported DAY replaces that day’s plan exactly; past workout history is never changed. Supports type=weight|band|bodyweight|timer|stopwatch; sides=single|lr; duration (seconds, timer only); weight; band; rest; notes (day-specific); description; persistent_notes; youtube_url; main; warmup; superset=A|B|... (exercises sharing the same letter within a DAY are grouped together, both in the day plan and during the workout).</p>
+        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Supports type=weight|band|bodyweight|timer|stopwatch, sides=lr, duration (secs, timer only), weight, band, rest, notes, main, warmup. Existing days and exercises will be merged and updated, without duplicates.</p>
         <textarea
           rows={12}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
@@ -1583,10 +1646,10 @@ function startSession(db, mutate, dayId, navigate, showToast) {
     day.exercises.forEach((de, idx) => {
       const seId = uuid();
       const defs = defMap.get(de.exercise.id) || {};
-      // Planned values are authoritative. History fills only truly unspecified plan fields.
-      const prefillReps   = de.planned_reps != null ? de.planned_reps : (defs.reps || null);
-      const prefillWeight = de.planned_weight != null ? de.planned_weight : (defs.weight || null);
-      const prefillDur    = de.planned_duration_sec != null ? de.planned_duration_sec : (defs.duration_sec || null);
+      // Planned values win; last-session defaults fill in only when planned is absent
+      const prefillReps   = de.planned_reps   || defs.reps   || null;
+      const prefillWeight = de.planned_weight || defs.weight || null;
+      const prefillDur    = de.planned_duration_sec || defs.duration_sec || null;
       d.session_exercises.push({
         id: seId,
         session_id: sessionId,
@@ -1610,18 +1673,14 @@ function startSession(db, mutate, dayId, navigate, showToast) {
         // If the previous session had fewer sets, fall back to the last available set.
         const prevIdx = Math.min(i - 1, prevSets.length - 1);
         const prev = prevSets.length > 0 ? prevSets[prevIdx] : null;
-        // Do not prefill a prior actual result over an explicit new prescription.
-        const hasPlannedReps = de.planned_reps != null;
-        const hasPlannedWeight = de.planned_weight != null;
-        const hasPlannedDuration = de.planned_duration_sec != null;
         d.session_sets.push({
           id: uuid(),
           session_exercise_id: seId,
           set_number: i,
-          actual_reps: hasPlannedReps ? null : (prev?.reps ?? null),
-          actual_weight: hasPlannedWeight ? null : (prev?.weight ?? null),
+          actual_reps: prev?.reps ?? null,
+          actual_weight: prev?.weight ?? null,
           completed: 0,
-          actual_duration_sec: hasPlannedDuration ? null : (prev?.duration_sec ?? null),
+          actual_duration_sec: prev?.duration_sec ?? null,
           actual_duration_sec_left: null,
           actual_duration_sec_right: null,
         });
@@ -1697,13 +1756,9 @@ function SessionPage({ id }) {
   // ── Live stopwatch ────────────────────────────────────────────────────────
   const [elapsed, setElapsed] = useState(() => nowSec() - (session.started_at || nowSec()));
   useEffect(() => {
-    if (session.is_finished) {
-      setElapsed(session.duration_sec != null ? session.duration_sec : Math.max(0, (session.finished_at || nowSec()) - (session.started_at || nowSec())));
-      return;
-    }
     const t = setInterval(() => setElapsed(nowSec() - (session.started_at || nowSec())), 1000);
     return () => clearInterval(t);
-  }, [session.started_at, session.finished_at, session.duration_sec, session.is_finished]);
+  }, [session.started_at]);
   const fmtElapsed = (sec) => {
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
@@ -1812,27 +1867,6 @@ function SessionPage({ id }) {
     showToast('Exercise replaced');
   };
 
-  // Group consecutive session exercises that share the same superset_key so
-  // they can be visually boxed together during the workout. Exercises with
-  // no superset_key (the common case) render exactly as before, standalone.
-  const sessionItems = [];
-  {
-    let i = 0;
-    while (i < ses.length) {
-      const se = ses[i];
-      if (se.superset_key) {
-        const key = se.superset_key;
-        const label = se.superset_label;
-        const group = [];
-        while (i < ses.length && ses[i].superset_key === key) { group.push(ses[i]); i++; }
-        sessionItems.push({ kind: 'ss', key, label, group });
-      } else {
-        sessionItems.push({ kind: 'se', se });
-        i++;
-      }
-    }
-  }
-
   return (
     <PageShell title={day?.name || 'Session'} back={null}
       right={<div className="flex items-center gap-2">
@@ -1840,21 +1874,7 @@ function SessionPage({ id }) {
         <button onClick={cancel} className="p-2 text-red-600" aria-label="Cancel">{I.x}</button>
       </div>}>
       <div className="p-4 space-y-3 pb-36">
-        {sessionItems.map((item, i) => {
-          if (item.kind === 'se') {
-            return <SessionExercise key={item.se.id} se={item.se} onReplace={() => setReplaceSeId(item.se.id)} />;
-          }
-          return (
-            <div key={`ss-${item.key}-${i}`} className="rounded-2xl border-2 border-brand/40 bg-brand/5 p-2 space-y-2">
-              <div className="flex items-center gap-1 px-1 text-brand text-xs font-semibold uppercase tracking-wide">
-                {I.layers} {item.label || `Superset ${item.key}`}
-              </div>
-              <div className="space-y-2">
-                {item.group.map(se => <SessionExercise key={se.id} se={se} onReplace={() => setReplaceSeId(se.id)} />)}
-              </div>
-            </div>
-          );
-        })}
+        {ses.map(se => <SessionExercise key={se.id} se={se} onReplace={() => setReplaceSeId(se.id)} />)}
         <button onClick={() => setShowAddEx(true)}
           className="w-full flex items-center justify-center gap-2 py-3 rounded-xl border-2 border-dashed border-neutral-300 text-neutral-500 hover:border-brand hover:text-brand active:bg-brand/5 transition-colors text-sm font-medium">
           {I.plus} Add exercise
@@ -2008,6 +2028,7 @@ function SessionExercise({ se, onReplace }) {
   return (
     <Card className={`p-3 ${se.completed ? 'opacity-70' : ''}`}>
       <div className="flex items-start gap-2 mb-2">
+        {se.superset_label && <Badge className="bg-brand/15 text-brand font-medium shrink-0">{I.layers} {se.superset_label}</Badge>}
         <div className="flex-1 min-w-0">
           <div className="font-medium leading-snug">{ex.name}</div>
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
@@ -2796,20 +2817,29 @@ async function backgroundSync(db, opts) {
         var ex = exercisesById[se.exercise_id] || null;
         var sets = (setsBySesEx[se.id] || []).slice().sort(function(a,b){ return (a.set_number||0)-(b.set_number||0); });
         var completedSets = sets.filter(function(ss){ return !!ss.completed; });
+        var repsSummary, weightSummary;
         if (!completedSets.length) {
+          repsSummary = se.planned_reps != null ? se.planned_reps : '';
+          weightSummary = se.planned_weight != null ? se.planned_weight : '';
           historyRows.push({
             timestamp: sessionTimestamp,
             exercise: ex ? ex.name : '?',
-            reps: se.planned_reps != null ? se.planned_reps : '',
+            reps: repsSummary,
+            weight: weightSummary,
             sets: sets.length || '',
           });
         } else {
+          repsSummary = completedSets.map(function(ss){
+            return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
+          }).filter(function(v){ return v !== ''; }).join(', ');
+          weightSummary = completedSets.map(function(ss){
+            return ss.actual_weight != null ? ss.actual_weight : (se.planned_weight != null ? se.planned_weight : '');
+          }).filter(function(v){ return v !== ''; }).join(', ');
           historyRows.push({
             timestamp: sessionTimestamp,
             exercise: ex ? ex.name : '?',
-            reps: completedSets.map(function(ss){
-              return ss.actual_reps != null ? ss.actual_reps : (se.planned_reps != null ? se.planned_reps : '');
-            }).filter(function(v){ return v !== ''; }).join(', '),
+            reps: repsSummary,
+            weight: weightSummary,
             sets: completedSets.length,
           });
         }
@@ -2817,6 +2847,8 @@ async function backgroundSync(db, opts) {
           notesRows.push({
             timestamp: sessionTimestamp,
             exercise: ex ? ex.name : '?',
+            reps: repsSummary,
+            weight: weightSummary,
             note: se.session_note.trim(),
           });
         }
@@ -2828,6 +2860,8 @@ async function backgroundSync(db, opts) {
       notesRows.push({
         timestamp: '',
         exercise: ex ? ex.name : '',
+        reps: '',
+        weight: '',
         note: n.text || '',
       });
     });
@@ -2988,8 +3022,8 @@ async function backgroundSync(db, opts) {
   if (device !== 'computer') {
     tables.History = historyRows;
     tables.Notes = notesRows;
-    columns.History = ['timestamp', 'exercise', 'reps', 'sets'];
-    columns.Notes = ['timestamp', 'exercise', 'note'];
+    columns.History = ['timestamp', 'exercise', 'reps', 'weight', 'sets'];
+    columns.Notes = ['timestamp', 'exercise', 'reps', 'weight', 'note'];
     tabList = ['History', 'Exercises', 'Notes', 'Groups', 'WorkoutDays', 'DayExercises'];
   }
 
