@@ -798,10 +798,12 @@ function parseBulkExercises(text) {
 
       current.items.push({
         name,
+        superset: (fields['superset'] || '').trim(),
         sets: fields['sets'] || '',
         reps: fields['reps'] || '',
         rest: fields['rest'] || '',
         band: fields['band'] || '',
+        description: fields['description'] || '',
         notes: fields['notes'] || '',
         main: parseBool(fields['main']),
         warmup: parseBool(fields['warmup']),
@@ -824,6 +826,7 @@ function applyBulkExercises(d, parsedBlocks) {
   d.workout_days = d.workout_days || [];
   d.exercises = d.exercises || [];
   d.day_exercises = d.day_exercises || [];
+  d.supersets = d.supersets || [];
 
   function norm(v) {
     return String(v || '').trim().toLowerCase();
@@ -901,11 +904,43 @@ function applyBulkExercises(d, parsedBlocks) {
 
     const dayExForDay = d.day_exercises.filter(de => de.day_id === day.id);
 
+    // Supersets are scoped to this day. Match existing supersets by label
+    // (case-insensitive) so re-imports reuse the same group instead of
+    // creating duplicates every time.
+    const supersetByLabelForDay = new Map();
+    d.supersets.filter(s => s.day_id === day.id).forEach(s => {
+      supersetByLabelForDay.set(norm(s.label), s);
+    });
+
     items.forEach((item, idx) => {
       const key = norm(item.name);
       if (!key) return;
 
       const derived = deriveExerciseFields(item);
+
+      // Resolve/create this item's superset (if `superset=` was provided).
+      // Members are grouped purely by matching label within the same day —
+      // list them consecutively in the pasted text so their positions end up
+      // contiguous (the app groups supersets by consecutive position).
+      let supersetId = null;
+      const rawSuperset = String(item.superset || '').trim();
+      if (rawSuperset) {
+        const ssKey = norm(rawSuperset);
+        let ss = supersetByLabelForDay.get(ssKey);
+        if (!ss) {
+          const supersetsForDay = d.supersets.filter(s => s.day_id === day.id);
+          ss = {
+            id: uuid(),
+            day_id: day.id,
+            label: rawSuperset,
+            position: getNextPos(supersetsForDay),
+            created_at: nowSec(),
+          };
+          d.supersets.push(ss);
+          supersetByLabelForDay.set(ssKey, ss);
+        }
+        supersetId = ss.id;
+      }
 
       let ex = exByName.get(key);
       if (!ex) {
@@ -917,7 +952,10 @@ function applyBulkExercises(d, parsedBlocks) {
           bodyweight: derived.bodyweight,
           timer_mode: derived.timer_mode,
           bilateral: item.sides,
-          description: item.notes || '',
+          // `description=` is the exercise's own definition (e.g. how to set it up).
+          // It is independent from `notes=`, which is the day-specific PT cue.
+          // Fall back to notes only for older import lines that never set description.
+          description: item.description || item.notes || '',
           persistent_notes: item.notes || '',
           youtube_url: '',
           archived: 0,
@@ -935,7 +973,10 @@ function applyBulkExercises(d, parsedBlocks) {
           ex.timer_mode = derived.timer_mode;
         }
         if (item.sides) ex.bilateral = true;
-        if (item.notes) ex.description = item.notes;
+        // description= always wins when provided; otherwise fall back to notes=
+        // so exercises imported before this field existed keep working the same way.
+        if (item.description) ex.description = item.description;
+        else if (item.notes) ex.description = item.notes;
         if (item.notes && !ex.persistent_notes) ex.persistent_notes = item.notes;
       }
 
@@ -953,12 +994,16 @@ function applyBulkExercises(d, parsedBlocks) {
           notes: '',
           warmup: 0,
           main: 0,
-          superset_id: null,
+          superset_id: supersetId,
           rest_hint: null,
           band_hint: null,
         };
         d.day_exercises.push(de);
         dayExForDay.push(de);
+      } else if (rawSuperset) {
+        // Only touch superset_id when this import line actually specifies one —
+        // re-imports that omit `superset=` leave any manually-set grouping alone.
+        de.superset_id = supersetId;
       }
 
       if (item.sets) {
@@ -997,10 +1042,12 @@ function BulkExerciseImportModal({ open, onClose }) {
   const example = [
     'DAY: Small Day D',
     'GROUP: Shoulder Rehab',
-    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | rest=30s | notes=easy warmup | main=false | warmup=true',
+    'EXERCISE: Cat-Camel or Open-Book | sets=1 | reps=8-10 | type=bodyweight | rest=30s | description=On hands and knees, alternate arching and rounding the spine | notes=easy warmup | main=false | warmup=true',
     'EXERCISE: Band Face Pull | sets=2-3 | reps=12-15 | type=band | band=medium | rest=60s | notes=elbows high no shrug | main=true | warmup=false',
     'EXERCISE: Standing Scap Retractions | sets=2 | reps=10-12 | type=bodyweight | rest=45s | notes=gently back and down | main=false | warmup=false',
     'EXERCISE: Standing or Kneeling Band 90-90 ER-IR | sets=3 | reps=10/side | type=band | band=light | sides=lr | weight=red | rest=45s | notes=slow controlled | main=true | warmup=false',
+    'EXERCISE: Copenhagen Plank | superset=B | sets=3 | type=timer | duration=15-20 | sides=lr | rest=45s | description=Side plank with the top leg supported on a bench, bottom leg lifts to meet it | notes=progress lever as tolerated | main=true | warmup=false',
+    'EXERCISE: Bird Dog | superset=B | sets=3 | reps=8/side | type=bodyweight | sides=lr | rest=45s | notes=slow, no rotation | main=true | warmup=false',
     'EXERCISE: Front Plank Hold | sets=3 | type=stopwatch | rest=60s | notes=brace core | main=true | warmup=false',
     'EXERCISE: Dead Bug Hold | sets=3 | reps=1 | type=timer | duration=20 | sides=lr | rest=30s | notes=keep low back flat | main=false | warmup=false',
     '',
@@ -1044,7 +1091,7 @@ function BulkExerciseImportModal({ open, onClose }) {
   return (
     <Modal open={open} onClose={onClose} title="Bulk import exercises">
       <div className="space-y-3">
-        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Supports type=weight|band|bodyweight|timer|stopwatch, sides=lr, duration (secs, timer only), weight, band, rest, notes, main, warmup. Existing days and exercises will be merged and updated, without duplicates.</p>
+        <p className="text-xs text-neutral-500">Paste one or many DAY blocks. Supports type=weight|band|bodyweight|timer|stopwatch, sides=lr, duration (secs, timer only), weight, band, rest, description, notes, main, warmup, superset. `description=` sets the exercise's own definition (shown on the Exercises list); `notes=` is the day-specific PT cue (shown during sessions and refreshed on every re-import). `superset=A` groups same-day exercises sharing that label — list a superset's members consecutively so they end up grouped correctly. Existing days and exercises will be merged and updated, without duplicates.</p>
         <textarea
           rows={12}
           className="w-full border rounded-xl px-3 py-2 text-xs font-mono"
@@ -3449,6 +3496,50 @@ function SettingsPage() {
     window.open(SHEETURL, '_blank', 'noopener,noreferrer');
   };
 
+  const addSeparator = async () => {
+    var ok = window.confirm(
+      "Add a black separator line to the Notes sheet now? Use this after you've copied your notes over to the PT thread."
+    );
+    if (!ok) return;
+
+    setSyncing(true);
+    setSyncStatus('syncing');
+
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 30000);
+
+    try {
+      var payload = {
+        action: 'separator',
+        timestamp: new Date().toISOString()
+      };
+
+      var res = await fetch(SYNCURL, {
+        method: 'POST',
+        signal: controller.signal,
+        body: new URLSearchParams({ payload: JSON.stringify(payload) })
+      });
+      clearTimeout(timer);
+
+      var text = await res.text();
+      var json = null;
+      try { json = JSON.parse(text); } catch (e) {}
+
+      if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text.slice(0, 80));
+      if (json && json.error) throw new Error(json.error);
+
+      setSyncStatus('ok');
+      showToast('Separator added to Notes sheet');
+    } catch (err) {
+      clearTimeout(timer);
+      setSyncStatus('error');
+      var msg = (err && err.name === 'AbortError') ? 'Timed out after 30s' : ((err && err.message) ? err.message : String(err));
+      showToast('Separator failed: ' + msg);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const statusColor = {
     idle: 'text-neutral-400',
     syncing: 'text-yellow-500',
@@ -3492,6 +3583,10 @@ function SettingsPage() {
 
           <Button variant="outline" className="w-full text-xs mb-2" onClick={pullFromSheetsNow} disabled={syncing || pulling}>
             {pulling ? 'Pulling...' : 'Pull now'}
+          </Button>
+
+          <Button variant="outline" className="w-full text-xs mb-2" onClick={addSeparator} disabled={syncing || pulling}>
+            Add separator line
           </Button>
 
           <Button variant="outline" className="w-full text-xs mb-3" onClick={openSheet}>
